@@ -245,6 +245,7 @@ fn attribute_keys(a: &Value) -> &'static [&'static str] {
 /// An SSID's security, worked out once and then rendered for each of its bands.
 pub(crate) struct Security {
     encryption: &'static str,
+    kind: Kind,
     mfp: Mfp,
     configured_mfp: &'static str,
     /// `ieee80211w` as the configuration gave it, when it did.
@@ -619,11 +620,29 @@ impl Security {
         }
         Some(Security {
             encryption,
+            kind,
             mfp,
             configured_mfp,
             asked_mfp: enc.get("ieee80211w").cloned(),
             values,
         })
+    }
+
+    /// Whether it's WPA2 or later with a key or 802.1X: what fast roaming needs.
+    pub(crate) fn roams(&self) -> bool {
+        matches!(self.kind, Kind::Psk | Kind::Eap) && !matches!(self.encryption, "psk" | "wpa")
+    }
+
+    /// Whether it's WPA2-PSK without SAE: the only kind that can generate FT responses locally.
+    pub(crate) fn is_wpa2_psk(&self) -> bool {
+        matches!(self.encryption, "psk2" | "psk-mixed")
+    }
+
+    /// An enterprise network's RADIUS secret.
+    pub(crate) fn radius_secret(&self) -> Option<&str> {
+        (self.kind == Kind::Eap)
+            .then(|| self.values.get("auth_secret").and_then(Value::as_str))
+            .flatten()
     }
 
     /// The options for the SSID at `at` on `band` (UCI's: `2g`, `5g`, `6g`; `band_at` its entry

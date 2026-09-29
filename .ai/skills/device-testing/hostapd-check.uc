@@ -13,7 +13,7 @@ import { dump_config, flush_config } from 'wifi.common';
 import * as fs from 'fs';
 
 const COMMON = [ 'interface', 'bss', 'bssid', 'ctrl_interface', 'bridge', 'snoop_iface', 'ssid2', 'wmm_enabled', 'dtim_period', 'start_disabled' ];
-const SECRET = /(secret|passphrase|wpa_psk|_kh|password)/;
+const SECRET = /(secret|passphrase|wpa_psk|r[01]kh|password)/;
 
 for (let i, ssid in json(fs.readfile(ARGV[0]))) {
 	let config = { ...ssid.options, ifname: 'check' + i, macaddr: '00:00:5e:00:53:0' + i };

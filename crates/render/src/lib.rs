@@ -10,9 +10,11 @@
 //! [`Plan::radio_options`], for the agent to record what it replaces.
 
 mod network;
+mod roaming;
 mod security;
 
 pub use network::{Network, Ports, Vlan};
+pub use roaming::Usteer;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use steward_proto::Rejection;
@@ -107,6 +109,8 @@ pub struct Wireless {
     pub owned: Vec<String>,
     /// The options each owned section has now.
     pub options: BTreeMap<String, Vec<String>>,
+    /// usteer, the steering daemon; `None` when it isn't installed.
+    pub usteer: Option<Usteer>,
 }
 
 impl Wireless {
@@ -572,7 +576,7 @@ fn radios(config: &Value, current: &Wireless, plan: &mut Plan) {
 }
 
 /// The keys of an SSID that [`ssids`] handles; any other is rejected.
-const SSID_KEYS: [&str; 8] = [
+const SSID_KEYS: [&str; 11] = [
     "name",
     "wifi-bands",
     "bss-mode",
@@ -581,6 +585,9 @@ const SSID_KEYS: [&str; 8] = [
     "isolate-clients",
     "radius",
     "certificates",
+    "roaming",
+    "rrm",
+    "services",
 ];
 
 /// The SSIDs: one owned `wifi-iface` per SSID per band.
@@ -664,6 +671,8 @@ fn ssids(
             let Some(security) = security::Security::of(ssid, &at, plan) else {
                 continue;
             };
+            let roaming =
+                roaming::options(ssid, name, &at, &security, current.usteer.as_ref(), plan);
             let Some(bands) = ssid
                 .get("wifi-bands")
                 .and_then(Value::as_array)
@@ -709,6 +718,7 @@ fn ssids(
                 let Some(mut values) = security.on(&radio.band, &at, &band_at, plan) else {
                     continue;
                 };
+                values.extend(roaming.clone());
                 values.insert("device".into(), json!(radio.section));
                 values.insert("mode".into(), json!("ap"));
                 values.insert("ssid".into(), json!(name));

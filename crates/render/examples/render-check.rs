@@ -6,7 +6,7 @@
 //! `--hostapd` also writes the SSIDs' planned options, with their bands, for
 //! `.ai/skills/device-testing/hostapd-check.uc`. That file holds the secrets: remove it after.
 use serde_json::{Map, Value, json};
-use steward_render::{Current, Network, Op, Ports, Wireless, render};
+use steward_render::{Current, Network, Op, Ports, Usteer, Wireless, render};
 use steward_ubus::Ubus;
 use steward_ubus::uci::Transaction;
 
@@ -49,6 +49,11 @@ fn main() {
     });
     for r in &current.radios {
         println!("radio {} ({}): htmodes {:?}", r.section, r.band, r.htmodes);
+    }
+    // As the agent does (steward-agent/src/apply.rs, `usteer`).
+    if std::path::Path::new("/sbin/usteerd").exists() {
+        let config = ubus.call("usteer", "get_config", &Map::new()).ok();
+        current.usteer = Some(Usteer::from_config(config.as_ref()));
     }
     let plan = render(
         &config,

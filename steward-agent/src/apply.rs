@@ -20,7 +20,7 @@ use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use steward_proto::{CommandStatus, Rejection, configure_error};
-use steward_render::{Current, Network, Op, Plan, Ports, Wireless};
+use steward_render::{Current, Network, Op, Plan, Ports, Usteer, Wireless};
 use steward_ubus::Ubus;
 use steward_ubus::uci::Transaction;
 
@@ -109,6 +109,16 @@ pub fn status(rejected: Vec<Rejection>, applied: bool, text: &str) -> CommandSta
     }
 }
 
+/// usteer as it runs: `None` when it isn't installed. What it steers is asked of the daemon, not
+/// read from its UCI: sections later in `/etc/config/usteer` replace earlier ones' lists.
+pub fn usteer(ubus: &mut Ubus) -> Option<Usteer> {
+    if !Path::new("/sbin/usteerd").exists() {
+        return None;
+    }
+    let config = ubus.call("usteer", "get_config", &Map::new()).ok();
+    Some(Usteer::from_config(config.as_ref()))
+}
+
 /// What staging a configuration came to.
 pub enum Staged {
     /// Nothing to change: the device already runs it, and no apply is pending that could
@@ -187,6 +197,7 @@ pub fn stage(state: &State, config: &Value, rollback: Duration) -> Result<Staged
         )
         .ok()
     });
+    wireless.usteer = usteer(&mut ubus);
     let plan = steward_render::render(
         config,
         &Current {

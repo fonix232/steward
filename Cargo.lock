@@ -823,6 +823,7 @@ dependencies = [
 name = "steward-render"
 version = "0.1.0"
 dependencies = [
+ "ring",
  "serde_json",
  "steward-proto",
  "steward-ubus",

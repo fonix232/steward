@@ -18,3 +18,4 @@
 16. [STW-18: Device state and health](018-device-state-and-health.md)
 17. [STW-19: Clients](019-clients.md)
 18. [STW-22: 802.1X / RADIUS WiFi](022-802-1x-radius-wifi.md)
+19. [STW-23: Band steering and fast roaming](023-band-steering-and-fast-roaming.md)

@@ -99,6 +99,12 @@ So Steward renders the schema itself (`crates/render`), into UCI sections the ag
     - Request attributes are hostapd's `<id>:s:<text>`, `<id>:d:<number>` (32 bits), `<id>:x:<hex>`, and vendor attributes `26:x:<vendor, 8 hex digits><type><length><value>` (vendor 1 to 65535, the schema's bounds, with at least one attribute, each id 1 to 255). A value is 253 bytes at most, the vendor attribute's 4-byte id and sub-attributes included: hostapd loads a longer one, then fails every request it would go in, so nobody could authenticate.
     - RADIUS-assigned VLANs stay off (`dynamic_vlan` 0).
     - OpenWrt's generator writes an EAP network's accounting server twice. That's stock behaviour, the same for LuCI's networks.
+  - Fast roaming and steering (`crates/render/src/roaming.rs`):
+    - `roaming` (true or its object) → `ieee80211r`, `ft_over_ds` (`message-exchange`, air by default), `mobility_domain` (`domain-identifier`, 4 hex digits; otherwise the scripts derive one from the SSID, the same on every AP and band), `ft_psk_generate_local` (`generate-psk`, WPA2-PSK only), `r0kh`/`r1kh` from `pmk-r0/r1-key-holder` (a pair, checked as hostapd's `add_r0kh`/`add_r1kh` do: R0 `<MAC>,<R0KH-ID of 1 to 47 characters>,<key>`, R1 `<MAC>,<R1KH-ID, a MAC>,<key>`, keys 32 or 64 hex digits; TIP's own example R1KH-ID `14DD204714E4` isn't a MAC, and a holder hostapd refuses fails the radio) or both from `key-aes-256`. Key holders given beside `key-aes-256` are refused, and the shared key's stand. It needs WPA2 or later with a key or 802.1X.
+    - For EAP the stock scripts can't derive the key holders' key: they read `auth_secret`, which validation has renamed to `auth_server_shared_secret`, and `FT_KEY_CANT_BE_DERIVED` fails the whole radio. So an enterprise SSID without key holders gets wildcard ones with a key derived from its name and RADIUS secret (SHA-256), the same on every AP. That includes one whose `key-aes-256` or key holders were refused.
+    - `rrm` → `ieee80211k` (`neighbor-reporting`, which also turns on beacon reports), `rnr`, `ftm_responder`, `lci`, `civic` (the scripts write the last three only on a radio that can be an FTM responder). `stationary-ap` is a radio option, refused. `lci` and `civic-location` are 1 to 255 bytes as hex digits, a measurement subelement's most: hostapd reads its config in 4096-byte lines, so a longer value splits into an invalid line and fails the radio.
+    - `services: ["wifi-steering"]` → `bss_transition` and `ieee80211k`, and usteer steers the SSID with its own settings (band steering is on by default in the current usteer, via BSS transition requests). The agent asks the running daemon (`usteer get_config`), not its UCI: a later `usteer` section replaces an earlier one's `ssid_list`, and no list means every SSID. Steward never edits usteer. When usteer isn't installed, isn't running, or lists only other SSIDs, steering is refused and the SSID keeps 802.11k/v. Every other service is refused, and so is a `services` that isn't a list of strings.
+    - A value of the wrong kind (`"yes"` for `generate-psk` or `neighbor-reporting`, an `rrm` that isn't an object) is rejected and left to the default.
   - No string with a control character is written into an option hostapd reads: most are written unquoted, one per line, so a newline would add a line of its own.
   - Network: its interface's (below).
   - An owned section set again loses the options the configuration no longer gives it (`Op::Unset`), for example a network that stops using RADIUS.
@@ -121,10 +127,13 @@ So Steward renders the schema itself (`crates/render`), into UCI sections the ag
   - top level: `uuid`, `radios`, `interfaces`;
   - radio: `band`, `channel`, `channel-mode`, `channel-width`, `country`, `tx-power`, `enable`;
   - interface: `name`, `role`, `vlan` (`id`, `proto`), `ethernet` (`select-ports`, `vlan-tag`), `ssids`, `ipv4`;
-  - SSID: `name`, `wifi-bands`, `bss-mode`, `encryption`, `hidden-ssid`, `isolate-clients`, `radius`, `certificates`;
+  - SSID: `name`, `wifi-bands`, `bss-mode`, `encryption`, `hidden-ssid`, `isolate-clients`, `radius`, `certificates`, `roaming`, `rrm`, `services`;
   - `encryption`: `proto`, `key`, `ieee80211w`, `key-caching`, `eap-reauth-period`;
   - `radius`: `authentication` (`host`, `port`, `secret`, `secondary`, `request-attribute`, `mac-filter`), `accounting` (`host`, `port`, `secret`, `secondary`, `request-attribute`, `interval`), `dynamic-authorization` (`host`, `port`, `secret`), `nas-identifier`, `chargeable-user-id`, and `local` and `health`, refused on their own; a `secondary`: `host`, `port`, `secret`;
-  - request attribute: `id` with `value` or with `hex-value`, or `vendor-id` with `vendor-attributes` (`id`, `value`), each form reading only its own keys.
+  - request attribute: `id` with `value` or with `hex-value`, or `vendor-id` with `vendor-attributes` (`id`, `value`), each form reading only its own keys;
+  - `roaming`: `message-exchange`, `generate-psk`, `domain-identifier`, `pmk-r0-key-holder`, `pmk-r1-key-holder`, `key-aes-256`;
+  - `rrm`: `neighbor-reporting`, `reduced-neighbor-reporting`, `ftm-responder`, `lci`, `civic-location`, and `stationary-ap`, refused on its own;
+  - `services` entry: `wifi-steering`.
 
   A value of the wrong kind (`"20"` for a tx power, `"yes"` for a boolean, an SSID without bands) is rejected, never guessed at.
 - **Rejected** (the answer's `rejected` list):
