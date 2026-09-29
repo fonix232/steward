@@ -8,3 +8,4 @@
 6. [STW-5: Agent–controller connection](005-agent-controller-connection.md)
 7. [STW-6: Find the controller automatically](006-find-the-controller-automatically.md)
 8. [STW-9: Encrypted device channel (wss://)](009-encrypted-device-channel-wss.md)
+9. [STW-10: Adopt devices](010-adopt-devices.md)

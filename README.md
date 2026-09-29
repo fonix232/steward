@@ -2,7 +2,7 @@
 
 A free and open-source network controller for OpenWrt, aiming at the experience UniFi gives: install it on the router, and the access points, switches and other OpenWrt devices on the network are adopted and managed from one web interface. Topology, per-device and per-client traffic, and IDS/IPS are part of the plan.
 
-**Status: early.** The agent connects to the controller over TLS (`wss://`), pinning the controller's certificate authority the first time it connects, and reports what the device is and its state (load, memory, uptime). With no controller given, it looks for one on its default gateway. The controller sends a device its stored configuration (`/etc/steward/configs/<serial>.json`), and the agent refuses it: applying configurations isn't implemented yet. Adoption, the configuration renderer and the web interface come next.
+**Status: early.** The agent connects to the controller over TLS (`wss://`), pinning the controller's certificate authority the first time it connects, and reports what the device is and its state (load, memory, uptime). With no controller given, it looks for one on its default gateway. A new device waits as pending until it's adopted (`steward-controller adopt <serial>`); adoption gives it a credential it presents from then on. The controller sends an adopted device its stored configuration (`/etc/steward/configs/<serial>.json`), and the agent refuses it: applying configurations isn't implemented yet. The configuration renderer and the web interface come next.
 
 ## How it fits together (the design)
 

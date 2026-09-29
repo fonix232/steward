@@ -1,0 +1,561 @@
+//! Which devices the controller manages, kept in `<state dir>/devices.json`.
+//!
+//! A device's first connection makes it **pending**: it stays connected so the controller
+//! knows it's there, and it is sent nothing. Adopting it makes it **adopting**: the next
+//! time it's connected, the controller issues a credential (a random token) and sends it
+//! with `steward.adopt`. Once the device confirms, it is **adopted**, and from then on it
+//! must present that credential on every connection; the controller keeps only its SHA-256.
+//! Forgetting a device drops its record, and with it the credential.
+//!
+//! Anything that connects becomes pending, so pending devices are kept in memory only (a
+//! controller restart forgets them until they connect again), at most [`MAX_PENDING`] of
+//! them, and what they report is cut to [`MAX_TEXT`] bytes. Room is made by dropping the
+//! oldest pending device that isn't connected, and only when all are connected the oldest
+//! one, disconnected with its record ([`Devices::take_dropped`]): no more than that many stay
+//! connected either, and devices that connect and hang up can't push out one that's there.
+//! Only adopting and adopted devices, which someone approved, are written to the file, on the
+//! router's flash.
+
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, VecDeque};
+use std::fs;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Standing {
+    Pending,
+    Adopting,
+    Adopted,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Record {
+    pub standing: Standing,
+    /// SHA-256 (hex) of the credential issued to the device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_sha256: Option<String>,
+    pub first_seen: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware: Option<String>,
+}
+
+/// What a connecting device gets.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// Not adopted: connected for the controller's bookkeeping, sent nothing.
+    Pending,
+    /// Adopted, credential not delivered yet: deliver this one, then call [`Devices::delivered`].
+    Deliver(String),
+    /// Adopted, and it presented its credential.
+    Admitted,
+    /// Adopted, and the credential is missing or wrong.
+    Refused,
+}
+
+#[derive(Debug)]
+pub struct Error(pub String);
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// Pending devices kept, at most: past it, the oldest one that isn't connected is dropped,
+/// or when all are, the oldest (and disconnected).
+pub const MAX_PENDING: usize = 64;
+/// The longest serial accepted, and model or firmware kept, in bytes.
+const MAX_TEXT: usize = 128;
+
+pub struct Devices {
+    path: PathBuf,
+    records: BTreeMap<String, Record>,
+    /// Pending devices' serials, oldest first. Their records are in memory only.
+    pending: VecDeque<String>,
+    /// Pending devices dropped to make room, whose connections are still to be closed.
+    dropped: Vec<String>,
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, data)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A new credential: 32 random bytes, as hex.
+fn new_credential() -> Result<String, Error> {
+    let mut b = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut b)
+        .map_err(|_| Error("no randomness for a credential".into()))?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+/// Equal hashes, compared in constant time.
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
+}
+
+/// What a device reported, cut to [`MAX_TEXT`] bytes (at a character boundary).
+fn clip(s: &str) -> String {
+    let mut end = s.len().min(MAX_TEXT);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_owned()
+}
+
+impl Devices {
+    pub fn load(path: &Path) -> Result<Devices, Error> {
+        let mut records: BTreeMap<String, Record> = match fs::read(path) {
+            Ok(data) => serde_json::from_slice(&data)
+                .map_err(|e| Error(format!("{}: {e}", path.display())))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => return Err(Error(format!("{}: {e}", path.display()))),
+        };
+        // Pending devices aren't kept across restarts: they're back when they next connect.
+        records.retain(|_, r| r.standing != Standing::Pending);
+        Ok(Devices {
+            path: path.to_owned(),
+            records,
+            pending: VecDeque::new(),
+            dropped: Vec::new(),
+        })
+    }
+
+    /// Writes the adopting and adopted devices: pending ones stay in memory.
+    fn save(&self) -> Result<(), Error> {
+        let io = |e: std::io::Error| Error(format!("{}: {e}", self.path.display()));
+        if let Some(dir) = self.path.parent() {
+            fs::create_dir_all(dir).map_err(io)?;
+        }
+        let tmp = self.path.with_extension("tmp");
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(io)?;
+        let kept: BTreeMap<&String, &Record> = self
+            .records
+            .iter()
+            .filter(|(_, r)| r.standing != Standing::Pending)
+            .collect();
+        f.write_all(&serde_json::to_vec_pretty(&kept).map_err(|e| Error(e.to_string()))?)
+            .map_err(io)?;
+        f.sync_all().map_err(io)?;
+        fs::rename(&tmp, &self.path).map_err(io)
+    }
+
+    pub fn all(&self) -> &BTreeMap<String, Record> {
+        &self.records
+    }
+
+    pub fn is_adopted(&self, serial: &str) -> bool {
+        self.records
+            .get(serial)
+            .is_some_and(|r| r.standing == Standing::Adopted)
+    }
+
+    /// A device connected, presenting `credential` if it has one. `connected` tells which
+    /// others are connected now, for making room among the pending ones.
+    pub fn admit(
+        &mut self,
+        serial: &str,
+        credential: Option<&str>,
+        model: Option<&str>,
+        firmware: &str,
+        connected: impl Fn(&str) -> bool,
+    ) -> Result<Admission, Error> {
+        if serial.len() > MAX_TEXT {
+            return Err(Error(format!("a serial of {} bytes", serial.len())));
+        }
+        let before = self.records.get(serial).cloned();
+        if before.is_none() {
+            self.pending.retain(|s| s != serial);
+            self.pending.push_back(serial.to_owned());
+        }
+        let record = self
+            .records
+            .entry(serial.to_owned())
+            .or_insert_with(|| Record {
+                standing: Standing::Pending,
+                credential_sha256: None,
+                first_seen: now(),
+                adopted_at: None,
+                model: None,
+                firmware: None,
+            });
+        record.model = model.map(clip).or(record.model.take());
+        record.firmware = Some(clip(firmware));
+        let admission = match record.standing {
+            Standing::Pending => Admission::Pending,
+            Standing::Adopting => {
+                let credential = new_credential()?;
+                record.credential_sha256 = Some(sha256_hex(credential.as_bytes()));
+                Admission::Deliver(credential)
+            }
+            Standing::Adopted => match (credential, &record.credential_sha256) {
+                (Some(c), Some(hash)) if same(&sha256_hex(c.as_bytes()), hash) => {
+                    Admission::Admitted
+                }
+                _ => Admission::Refused,
+            },
+        };
+        // devices.json lives on flash: write only what changed, and never for a pending
+        // device (anything that connects is one).
+        let after = &self.records[serial];
+        if after.standing != Standing::Pending && before.as_ref() != Some(after) {
+            self.save()?;
+        }
+        // This one is connecting now.
+        self.trim(|s| s == serial || connected(s));
+        Ok(admission)
+    }
+
+    /// Drops pending devices past [`MAX_PENDING`]: the oldest that isn't `connected`, or when
+    /// all are, the oldest.
+    fn trim(&mut self, connected: impl Fn(&str) -> bool) {
+        let records = &self.records;
+        self.pending.retain(|s| {
+            records
+                .get(s)
+                .is_some_and(|r| r.standing == Standing::Pending)
+        });
+        while self.pending.len() > MAX_PENDING {
+            let i = self.pending.iter().position(|s| !connected(s));
+            if let Some(dropped) = self.pending.remove(i.unwrap_or(0)) {
+                self.records.remove(&dropped);
+                self.dropped.push(dropped);
+            }
+        }
+    }
+
+    /// The pending devices dropped to make room since the last call. The caller closes the
+    /// connections of those that are connected, so records and connections go together: a
+    /// connected device is always one that's listed (and can be adopted), and at most
+    /// [`MAX_PENDING`] pending devices are connected. A dropped device is pending again when it
+    /// reconnects.
+    pub fn take_dropped(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.dropped)
+    }
+
+    /// Approve a pending device. It gets its credential the next time it's connected.
+    pub fn adopt(&mut self, serial: &str) -> Result<(), Error> {
+        let record = self
+            .records
+            .get_mut(serial)
+            .ok_or_else(|| Error(format!("no device {serial} has connected")))?;
+        match record.standing {
+            Standing::Adopted => return Err(Error(format!("{serial} is already adopted"))),
+            Standing::Adopting => {}
+            Standing::Pending => record.standing = Standing::Adopting,
+        }
+        self.save()
+    }
+
+    /// Issue a credential to a device being adopted that is connected now.
+    pub fn issue(&mut self, serial: &str) -> Result<Option<String>, Error> {
+        match self.records.get_mut(serial) {
+            Some(r) if r.standing == Standing::Adopting => {
+                let credential = new_credential()?;
+                r.credential_sha256 = Some(sha256_hex(credential.as_bytes()));
+                self.save()?;
+                Ok(Some(credential))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The device confirmed it stored its credential.
+    pub fn delivered(&mut self, serial: &str) -> Result<(), Error> {
+        if let Some(r) = self.records.get_mut(serial)
+            && r.standing == Standing::Adopting
+            && r.credential_sha256.is_some()
+        {
+            r.standing = Standing::Adopted;
+            r.adopted_at = Some(now());
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Drop a device and its credential. True when there was one.
+    pub fn forget(&mut self, serial: &str) -> Result<bool, Error> {
+        let Some(forgotten) = self.records.remove(serial) else {
+            return Ok(false);
+        };
+        if forgotten.standing != Standing::Pending {
+            self.save()?;
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store(name: &str) -> (PathBuf, Devices) {
+        let dir =
+            std::env::temp_dir().join(format!("steward-devices-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("devices.json");
+        let d = Devices::load(&path).unwrap();
+        (dir, d)
+    }
+
+    /// No other device is connected.
+    fn offline(_: &str) -> bool {
+        false
+    }
+
+    #[test]
+    fn a_device_goes_from_pending_to_adopted() {
+        let (dir, mut d) = store("flow");
+        let serial = "00005e005301";
+        // First connection: pending, sent nothing, however often it reconnects.
+        assert_eq!(
+            d.admit(serial, None, Some("E8450"), "OpenWrt", offline)
+                .unwrap(),
+            Admission::Pending
+        );
+        assert_eq!(
+            d.admit(serial, Some("guess"), None, "OpenWrt", offline)
+                .unwrap(),
+            Admission::Pending
+        );
+        assert!(!d.is_adopted(serial));
+
+        // Adopted while connected: a credential is issued; until it's confirmed, not adopted.
+        d.adopt(serial).unwrap();
+        let credential = d.issue(serial).unwrap().expect("a credential");
+        assert_eq!(credential.len(), 64);
+        assert!(!d.is_adopted(serial));
+        d.delivered(serial).unwrap();
+        assert!(d.is_adopted(serial));
+        assert!(d.adopt(serial).is_err(), "adopting twice");
+
+        // From now on the credential is required, and only it works.
+        assert_eq!(
+            d.admit(serial, Some(&credential), None, "OpenWrt", offline)
+                .unwrap(),
+            Admission::Admitted
+        );
+        assert_eq!(
+            d.admit(serial, None, None, "OpenWrt", offline).unwrap(),
+            Admission::Refused
+        );
+        // One character off: its last, changed to another hex digit.
+        let last = if credential.ends_with('0') { '1' } else { '0' };
+        let forged = format!("{}{last}", &credential[..63]);
+        assert_ne!(forged, credential);
+        assert_eq!(
+            d.admit(serial, Some(&forged), None, "OpenWrt", offline)
+                .unwrap(),
+            Admission::Refused
+        );
+
+        // It survives a restart, and the file holds no credential, only its hash.
+        let again = Devices::load(&dir.join("devices.json")).unwrap();
+        assert!(again.is_adopted(serial));
+        assert_eq!(again.all()[serial].model.as_deref(), Some("E8450"));
+        let text = fs::read_to_string(dir.join("devices.json")).unwrap();
+        assert!(!text.contains(&credential));
+        let mode = fs::metadata(dir.join("devices.json"))
+            .unwrap()
+            .permissions();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+            0o600
+        );
+
+        // Forgotten: the credential is revoked, and the device starts over as pending.
+        assert!(d.forget(serial).unwrap());
+        assert_eq!(
+            d.admit(serial, Some(&credential), None, "OpenWrt", offline)
+                .unwrap(),
+            Admission::Pending
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_adoption_approved_while_offline_is_delivered_on_connect() {
+        let (dir, mut d) = store("offline");
+        let serial = "00005e005302";
+        d.admit(serial, None, None, "OpenWrt", offline).unwrap();
+        d.adopt(serial).unwrap();
+        let Admission::Deliver(credential) =
+            d.admit(serial, None, None, "OpenWrt", offline).unwrap()
+        else {
+            panic!("expected a credential to deliver")
+        };
+        // Not confirmed (the connection dropped): the next connection gets a new one, and
+        // the undelivered one is worthless.
+        let Admission::Deliver(second) = d
+            .admit(serial, Some(&credential), None, "OpenWrt", offline)
+            .unwrap()
+        else {
+            panic!("expected a new credential")
+        };
+        assert_ne!(credential, second);
+        d.delivered(serial).unwrap();
+        assert_eq!(
+            d.admit(serial, Some(&credential), None, "OpenWrt", offline)
+                .unwrap(),
+            Admission::Refused
+        );
+        assert_eq!(
+            d.admit(serial, Some(&second), None, "OpenWrt", offline)
+                .unwrap(),
+            Admission::Admitted
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_connected_devices_can_be_adopted() {
+        let (dir, mut d) = store("unknown");
+        assert!(d.adopt("00005e005303").is_err());
+        assert!(!d.forget("00005e005303").unwrap());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pending_devices_stay_in_memory_and_the_oldest_go_first() {
+        let (dir, mut d) = store("pending");
+        let path = dir.join("devices.json");
+        let serial = |i: usize| format!("00005e{i:06x}");
+        let pending = |d: &Devices| {
+            d.all()
+                .values()
+                .filter(|r| r.standing == Standing::Pending)
+                .count()
+        };
+        // Anything that connects is pending, however many: nothing is written for them, and
+        // past MAX_PENDING the oldest are dropped.
+        for i in 0..MAX_PENDING + 3 {
+            let a = d.admit(&serial(i), None, None, "OpenWrt", offline).unwrap();
+            assert_eq!(a, Admission::Pending);
+        }
+        assert!(!path.exists(), "pending devices written to flash");
+        assert_eq!(pending(&d), MAX_PENDING);
+        for i in 0..3 {
+            assert!(
+                !d.all().contains_key(&serial(i)),
+                "{i} is one of the oldest"
+            );
+        }
+        // The dropped ones are handed over once, for their connections to be closed.
+        assert_eq!(d.take_dropped(), [serial(0), serial(1), serial(2)]);
+        assert!(d.take_dropped().is_empty());
+        // One that connects again keeps its place in the queue.
+        d.admit(&serial(3), None, Some("E8450"), "OpenWrt", offline)
+            .unwrap();
+        assert!(d.take_dropped().is_empty());
+        d.admit(&serial(MAX_PENDING + 3), None, None, "OpenWrt", offline)
+            .unwrap();
+        assert!(!d.all().contains_key(&serial(3)));
+        assert_eq!(d.take_dropped(), [serial(3)]);
+
+        // Adopted, a device is written, and no longer counts among the pending.
+        d.adopt(&serial(10)).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(&serial(10)) && !text.contains(&serial(11)),
+            "{text}"
+        );
+        for i in 100..100 + MAX_PENDING {
+            d.admit(&serial(i), None, None, "OpenWrt", offline).unwrap();
+        }
+        assert_eq!(pending(&d), MAX_PENDING);
+        assert!(d.all().contains_key(&serial(10)));
+        let dropped = d.take_dropped();
+        assert_eq!(dropped.len(), MAX_PENDING - 1);
+        assert!(!dropped.contains(&serial(10)));
+        // Forgetting a pending device writes nothing either.
+        fs::remove_file(&path).unwrap();
+        assert!(d.forget(&serial(100)).unwrap());
+        assert!(!path.exists());
+
+        // A restart forgets the pending devices; they're back when they next connect.
+        d.adopt(&serial(101)).unwrap();
+        let again = Devices::load(&path).unwrap();
+        let kept: Vec<&String> = again.all().keys().collect();
+        assert_eq!(kept, [&serial(10), &serial(101)]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pending_devices_that_are_not_connected_make_room_first() {
+        let (dir, mut d) = store("room");
+        let serial = |i: usize| format!("00005e{i:06x}");
+        // One device stays connected while 100 others connect and hang up: it's kept, and the
+        // oldest of the others go.
+        let there = serial(0);
+        let connected = |s: &str| s == there;
+        d.admit(&there, None, None, "OpenWrt", connected).unwrap();
+        for i in 1..=100 {
+            d.admit(&serial(i), None, None, "OpenWrt", connected)
+                .unwrap();
+        }
+        assert!(d.all().contains_key(&there));
+        let dropped: Vec<String> = (1..=100 - (MAX_PENDING - 1)).map(serial).collect();
+        assert_eq!(d.take_dropped(), dropped);
+        // All of them connected: the oldest goes, connected or not (and is disconnected).
+        d.admit(&serial(101), None, None, "OpenWrt", |_| true)
+            .unwrap();
+        assert_eq!(d.take_dropped(), [there]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn what_a_device_reports_is_cut_to_size() {
+        let (dir, mut d) = store("sizes");
+        let serial = "00005e005301";
+        let long = "x".repeat(10_000);
+        // Two bytes a character, one byte off: cut at a character boundary.
+        let firmware = format!("v{}", "é".repeat(1000));
+        d.admit(serial, None, Some(&long), &firmware, offline)
+            .unwrap();
+        let r = &d.all()[serial];
+        assert_eq!(r.model.as_deref(), Some(&long[..MAX_TEXT]));
+        let fw = r.firmware.as_deref().unwrap();
+        assert_eq!((fw.len(), fw.chars().count()), (MAX_TEXT - 1, MAX_TEXT / 2));
+        // A serial longer than that is refused, and nothing is recorded.
+        assert!(
+            d.admit(&long[..MAX_TEXT + 1], None, None, "OpenWrt", offline)
+                .is_err()
+        );
+        assert!(
+            d.admit(&long[..MAX_TEXT], None, None, "OpenWrt", offline)
+                .is_ok()
+        );
+        assert_eq!(d.all().len(), 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+}

@@ -14,6 +14,8 @@ steward-tls.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
+serde.workspace = true
+ring.workspace = true
 
 [dev-dependencies]
 # A paused clock: the time limits are tested without waiting them out.

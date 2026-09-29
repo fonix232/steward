@@ -7,11 +7,16 @@
 //! `<state dir>/controller-ca.pem`, and from then on only a controller whose
 //! certificate chains to that CA is accepted. Plain `ws://` needs
 //! `--allow-plaintext` (development only).
+//!
+//! Until the controller adopts the device, the agent has no credential and the
+//! controller sends it nothing. Adoption delivers one (`steward.adopt`), kept in
+//! `<state dir>/credential`; the agent presents it on every connection, as
+//! `Authorization: Bearer` on the WebSocket upgrade.
 
 mod device;
 
 use futures_util::{SinkExt, StreamExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use steward_proto::{self as proto, Message, command, event};
 use steward_tls::{PinFile, PinnedCa, ServerName, TlsConnector, fingerprint};
@@ -20,7 +25,8 @@ use tokio::net::TcpStream;
 use tokio::time::{Instant, interval, sleep, timeout, timeout_at};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as Frame;
-use tokio_tungstenite::tungstenite::http::Uri;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{HeaderValue, Uri, header::AUTHORIZATION};
 
 macro_rules! log {
     ($($t:tt)*) => { eprintln!("steward-agent: {}", format_args!($($t)*)) };
@@ -87,6 +93,7 @@ async fn main() {
         }
     }
     let pin = PinFile(state_dir.join("controller-ca.pem"));
+    let credential = Credential(state_dir.join("credential"));
 
     // Reconnect for ever, backing off to a minute. Without a controller
     // given, it is on the default gateway (the router, which usually hosts
@@ -105,7 +112,7 @@ async fn main() {
             },
         };
         let mut connected = None;
-        match session(&url, &pin, &mut connected).await {
+        match session(&url, &pin, &credential, &mut connected).await {
             Ok(()) => log!("controller closed the connection"),
             Err(e) => log!("{url}: {e}"),
         }
@@ -144,9 +151,33 @@ impl Default for Backoff {
 
 /// Connects to the controller: TLS checked against the pinned CA (or trusted on first use and
 /// pinned), then the WebSocket, all within [`OPEN_TIMEOUT`]. `connected` is set once `connect`
-/// has gone out.
-async fn session(url: &str, pin: &PinFile, connected: &mut Option<Instant>) -> Result<(), Error> {
+/// has gone out. A credential without a pin stops it before it connects: the credential is only
+/// for the controller the lost pin named, and without the pin any controller would be trusted
+/// and handed it.
+async fn session(
+    url: &str,
+    pin: &PinFile,
+    credential: &Credential,
+    connected: &mut Option<Instant>,
+) -> Result<(), Error> {
     let uri: Uri = url.parse()?;
+    let tls = uri.scheme_str() != Some("ws");
+    let pinned = if tls { pin.load()? } else { None };
+    let mut request = url.into_client_request()?;
+    if let Some(c) = credential.load()? {
+        if tls && pinned.is_none() {
+            return Err(format!(
+                "not connecting: this device has a credential ({}) but no pinned controller ({} is missing), and the credential is only for the controller that pin named. Restore the pin, or remove both files to move this device to another controller",
+                credential.path().display(),
+                pin.0.display()
+            )
+            .into());
+        }
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {c}"))?,
+        );
+    }
     let host = uri.host().ok_or("no host in the controller URL")?;
     let host = host
         .trim_start_matches('[')
@@ -154,23 +185,22 @@ async fn session(url: &str, pin: &PinFile, connected: &mut Option<Instant>) -> R
         .to_string();
     let port = uri.port_u16().unwrap_or(proto::PORT);
     let late = || format!("no answer in {} s", OPEN_TIMEOUT.as_secs());
-    if uri.scheme_str() == Some("ws") {
+    if !tls {
         let (ws, _) = timeout(OPEN_TIMEOUT, async {
             let tcp = TcpStream::connect((host.as_str(), port)).await?;
-            Ok::<_, Error>(tokio_tungstenite::client_async(url, tcp).await?)
+            Ok::<_, Error>(tokio_tungstenite::client_async(request, tcp).await?)
         })
         .await
         .map_err(|_| late())??;
-        return start(ws, url, connected).await;
+        return start(ws, url, credential, connected).await;
     }
-    let pinned = pin.load()?;
     let verifier = PinnedCa::new(pinned.clone());
     let connector = TlsConnector::from(verifier.client_config()?);
     let name = ServerName::try_from(host.clone())?;
     let (ws, _) = timeout(OPEN_TIMEOUT, async {
         let tcp = TcpStream::connect((host.as_str(), port)).await?;
         let tls = connector.connect(name, tcp).await?;
-        Ok::<_, Error>(tokio_tungstenite::client_async(url, tls).await?)
+        Ok::<_, Error>(tokio_tungstenite::client_async(request, tls).await?)
     })
     .await
     .map_err(|_| late())??;
@@ -189,18 +219,56 @@ async fn session(url: &str, pin: &PinFile, connected: &mut Option<Instant>) -> R
             }
         }
     }
-    start(ws, url, connected).await
+    start(ws, url, credential, connected).await
+}
+
+/// The credential the controller issued when it adopted this device.
+struct Credential(PathBuf);
+
+impl Credential {
+    fn load(&self) -> Result<Option<String>, Error> {
+        match std::fs::read_to_string(&self.0) {
+            Ok(c) => Ok(Some(c.trim().to_owned()).filter(|c| !c.is_empty())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{}: {e}", self.0.display()).into()),
+        }
+    }
+
+    /// Stores it readable by root only, replacing any older one.
+    fn save(&self, credential: &str) -> Result<(), Error> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Some(dir) = self.0.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = self.0.with_extension("tmp");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(credential.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &self.0)?;
+        Ok(())
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
 }
 
 /// A session on an open WebSocket: the device's identity, then [`talk`].
 async fn start<S: AsyncRead + AsyncWrite + Unpin>(
     ws: WebSocketStream<S>,
     url: &str,
+    credential: &Credential,
     connected: &mut Option<Instant>,
 ) -> Result<(), Error> {
     let info = tokio::task::spawn_blocking(device::identity).await??;
     log!("connected to {url} as {}", info.serial);
-    talk(ws, info, device::state, connected).await
+    talk(ws, info, device::state, credential, connected).await
 }
 
 /// The session's messages: `connect`, then the device's `state` (read by `state`) and a ping
@@ -210,6 +278,7 @@ async fn talk<S: AsyncRead + AsyncWrite + Unpin>(
     mut ws: WebSocketStream<S>,
     info: proto::Connect,
     state: fn() -> Result<serde_json::Value, steward_ubus::Error>,
+    credential: &Credential,
     connected: &mut Option<Instant>,
 ) -> Result<(), Error> {
     let serial = info.serial.clone();
@@ -231,13 +300,18 @@ async fn talk<S: AsyncRead + AsyncWrite + Unpin>(
                     None => return Ok(()),
                     Some(frame) => match frame? {
                         Frame::Text(t) => t.to_string(),
-                        Frame::Close(_) => return Ok(()),
+                        Frame::Close(frame) => {
+                            if let Some(f) = frame.filter(|f| !f.reason.is_empty()) {
+                                log!("the controller closed the connection: {}", f.reason);
+                            }
+                            return Ok(());
+                        }
                         _ => continue,
                     },
                 };
                 match serde_json::from_str::<Message>(&text) {
                     Ok(Message::Request { id, method, params, .. }) => {
-                        let answer = handle(&serial, &method, params).await;
+                        let answer = handle(&serial, &method, params, credential).await;
                         send(&mut ws, Message::result(id, answer)?).await?;
                     }
                     Ok(other) => log!("unexpected {other:?}"),
@@ -265,7 +339,12 @@ where
 }
 
 /// A controller command's answer.
-async fn handle(serial: &str, method: &str, params: serde_json::Value) -> proto::CommandResult {
+async fn handle(
+    serial: &str,
+    method: &str,
+    params: serde_json::Value,
+    credential: &Credential,
+) -> proto::CommandResult {
     let status = |error, text: &str| proto::CommandStatus {
         error,
         text: text.into(),
@@ -273,6 +352,35 @@ async fn handle(serial: &str, method: &str, params: serde_json::Value) -> proto:
         rejected: vec![],
     };
     match method {
+        command::ADOPT => {
+            let result = serde_json::from_value::<proto::Adopt>(params)
+                .map_err(Error::from)
+                .and_then(|a| {
+                    if a.serial == serial {
+                        credential.save(&a.credential)
+                    } else {
+                        Err(format!("a credential for {}, not this device", a.serial).into())
+                    }
+                });
+            let (error, text) = match result {
+                Ok(()) => {
+                    log!(
+                        "adopted by the controller; credential saved in {}",
+                        credential.path().display()
+                    );
+                    (0, "adopted".to_string())
+                }
+                Err(e) => {
+                    log!("couldn't take the credential: {e}");
+                    (1, e.to_string())
+                }
+            };
+            proto::CommandResult {
+                serial: serial.into(),
+                uuid: None,
+                status: status(error, &text),
+            }
+        }
         command::CONFIGURE => {
             let uuid = params.get("uuid").and_then(|u| u.as_u64());
             log!("configuration {uuid:?} received; applying configurations is not implemented yet");
@@ -332,6 +440,11 @@ mod tests {
         }
     }
 
+    /// No credential (a device not adopted yet).
+    fn nothing() -> Credential {
+        Credential(PathBuf::from("/nonexistent/steward-agent/credential"))
+    }
+
     fn state() -> Result<serde_json::Value, steward_ubus::Error> {
         Ok(serde_json::json!({ "unit": {} }))
     }
@@ -366,12 +479,13 @@ mod tests {
         let pin = PinFile(PathBuf::from(
             "/nonexistent/steward-agent/controller-ca.pem",
         ));
+        let credential = Credential(PathBuf::from("/nonexistent/steward-agent/credential"));
         for url in [format!("ws://{addr}"), format!("wss://{addr}")] {
             let start = Instant::now();
             let mut connected = None;
             let ended = timeout(
                 Duration::from_secs(3600),
-                session(&url, &pin, &mut connected),
+                session(&url, &pin, &credential, &mut connected),
             )
             .await;
             let err = ended.expect("still waiting after an hour").unwrap_err();
@@ -390,7 +504,8 @@ mod tests {
         let (agent, _controller) = pair().await;
         let start = Instant::now();
         let mut connected = None;
-        let talking = talk(agent, identity(), state, &mut connected);
+        let credential = nothing();
+        let talking = talk(agent, identity(), state, &credential, &mut connected);
         let ended = timeout(Duration::from_secs(24 * 3600), talking).await;
         let err = ended.expect("still talking after a day").unwrap_err();
         assert!(
@@ -406,7 +521,7 @@ mod tests {
         let (agent, mut controller) = pair().await;
         let session = tokio::spawn(async move {
             let mut connected = None;
-            talk(agent, identity(), state, &mut connected)
+            talk(agent, identity(), state, &nothing(), &mut connected)
                 .await
                 .map_err(|e| e.to_string())
         });
@@ -428,5 +543,85 @@ mod tests {
         // It ends when the controller closes the connection.
         controller.close(None).await.unwrap();
         session.await.unwrap().unwrap();
+    }
+
+    /// A controller on loopback with its own CA (created in `dir`): its URL, its identity, and
+    /// what the first upgrade within `wait` carried as `Authorization` (`None`: nothing
+    /// connected).
+    // tungstenite's upgrade callback returns its own (large) error response type.
+    #[allow(clippy::result_large_err)]
+    async fn controller(
+        dir: &Path,
+        wait: Duration,
+    ) -> (
+        String,
+        steward_tls::ControllerIdentity,
+        tokio::task::JoinHandle<Option<Option<String>>>,
+    ) {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+        let id = steward_tls::ControllerIdentity::load_or_create(dir).unwrap();
+        let acceptor = steward_tls::TlsAcceptor::from(id.server_config().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("wss://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (tcp, _) = tokio::time::timeout(wait, listener.accept())
+                .await
+                .ok()?
+                .ok()?;
+            let tls = acceptor.accept(tcp).await.ok()?;
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let s = seen.clone();
+            let _ws =
+                tokio_tungstenite::accept_hdr_async(tls, move |req: &Request, resp: Response| {
+                    let bearer = req.headers().get("authorization");
+                    *s.lock().unwrap() = bearer.and_then(|v| v.to_str().ok()).map(str::to_owned);
+                    Ok(resp)
+                })
+                .await;
+            let header = seen.lock().unwrap().take();
+            Some(header)
+        });
+        (url, id, task)
+    }
+
+    #[tokio::test]
+    async fn the_credential_goes_only_to_the_pinned_controller() {
+        let dir = std::env::temp_dir().join(format!("steward-agent-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pin = PinFile(dir.join("agent/controller-ca.pem"));
+        let credential = Credential(dir.join("agent/credential"));
+        let session = async |url: &str| {
+            let mut connected = None;
+            let s = session(url, &pin, &credential, &mut connected);
+            tokio::time::timeout(Duration::from_secs(10), s)
+                .await
+                .expect("a session that doesn't end")
+        };
+
+        // A credential and no pin (lost): refused before connecting, and nothing pinned.
+        credential.save("the-credential").unwrap();
+        let (url, a, seen) = controller(&dir.join("a"), Duration::from_millis(500)).await;
+        let err = session(&url).await.unwrap_err().to_string();
+        assert!(err.contains("no pinned controller"), "{err}");
+        assert_eq!(seen.await.unwrap(), None, "it connected");
+        assert!(pin.load().unwrap().is_none());
+
+        // With the pin of that controller, the credential goes with the upgrade. (The session
+        // then ends: this controller hangs up after the upgrade.)
+        pin.save(&a.ca).unwrap();
+        let (url, _, seen) = controller(&dir.join("a"), Duration::from_secs(10)).await;
+        let _ = session(&url).await;
+        let header = seen.await.unwrap();
+        assert_eq!(header, Some(Some("Bearer the-credential".into())));
+
+        // Neither (a device moved on purpose): the next controller is trusted on first use and
+        // pinned, and nothing is presented to it.
+        std::fs::remove_file(&pin.0).unwrap();
+        std::fs::remove_file(credential.path()).unwrap();
+        let (url, other, seen) = controller(&dir.join("b"), Duration::from_secs(10)).await;
+        let _ = session(&url).await;
+        assert_eq!(seen.await.unwrap(), Some(None));
+        assert_eq!(pin.load().unwrap(), Some(other.ca));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

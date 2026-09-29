@@ -135,6 +135,16 @@ pub mod command {
     pub const REQUEST: &str = "request";
     pub const PING: &str = "ping";
     pub const POWERCYCLE: &str = "powercycle";
+    /// Steward's own, not uCentral's: the device is adopted, and here is its credential.
+    pub const ADOPT: &str = "steward.adopt";
+}
+
+/// `steward.adopt`: the credential the device presents from now on, as
+/// `Authorization: Bearer <credential>` on the WebSocket upgrade.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Adopt {
+    pub serial: String,
+    pub credential: String,
 }
 
 /// `connect`: the first event on every connection.

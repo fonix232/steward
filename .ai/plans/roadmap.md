@@ -13,8 +13,7 @@
 
 1. **TLS and adoption.**
    - Done: the controller creates its own CA on first start and serves `wss://`; agents pin it on first use.
-   - A new device shows as pending, and the user adopts it.
-   - The controller then hands the device a credential, and later connections present it.
+   - Done: a new device waits as pending; adopting it (`steward-controller adopt`) hands it a credential that later connections present. The web interface will adopt through the same controller operations.
 2. **The configuration renderer.**
    - Render a subset of uCentral's schema into sections the agent owns and marks: radios, SSIDs, VLANs, ports.
    - Apply it through `uci::Transaction`, and confirm once the controller answers again.

@@ -612,6 +612,8 @@ name = "steward-controller"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "ring",
+ "serde",
  "serde_json",
  "steward-proto",
  "steward-tls",
