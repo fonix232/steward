@@ -22,7 +22,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use steward_proto::{CommandStatus, Rejection, configure_error};
-use steward_render::{Current, Network, Op, Plan, Poe, Ports, Usteer, Wireless};
+use steward_render::{
+    Current, Network, Op, Plan, Poe, Ports, Sections, Usteer, Wireless, dnsmasq_running,
+    firewall_active,
+};
 use steward_ubus::Ubus;
 use steward_ubus::uci::Transaction;
 
@@ -147,6 +150,17 @@ pub fn usteer(ubus: &mut Ubus) -> Option<Usteer> {
     Some(Usteer::from_config(config.as_ref()))
 }
 
+/// procd's view of a service (`service list {"name": …}`): `{}` when it isn't registered, or
+/// when procd can't be asked, which counts as not running.
+pub fn service(ubus: &mut Ubus, name: &str) -> Map<String, Value> {
+    ubus.call(
+        "service",
+        "list",
+        json!({ "name": name }).as_object().unwrap(),
+    )
+    .unwrap_or_default()
+}
+
 /// What staging a configuration came to.
 pub enum Staged {
     /// Nothing to change: the device already runs it, and no apply is pending that could
@@ -196,9 +210,10 @@ fn unchanged(t: &mut Transaction, before: &[(&str, &Map<String, Value>)]) -> Res
     Ok(true)
 }
 
-/// Renders `config` against the device's wireless and network configs, records the radio
-/// options it's about to replace, stages the changes to both in one transaction and applies
-/// them with a `rollback` window. Blocking.
+/// Renders `config` against the device's configs (wireless, network, and poe, dhcp and firewall
+/// where it has them) and whether dnsmasq and fw4 run (procd's `service list`), records the
+/// options of the device's own sections it's about to replace, stages the changes in one
+/// transaction and applies them with a `rollback` window. Blocking.
 pub fn stage(state: &State, config: &Value, rollback: Duration) -> Result<Staged, String> {
     let mut ubus = Ubus::connect().map_err(|e| e.to_string())?;
     let mut get = |name: &str| {
@@ -208,8 +223,22 @@ pub fn stage(state: &State, config: &Value, rollback: Duration) -> Result<Staged
     let current = get("wireless")?;
     let network_uci = get("network")?;
     let network = Network::from_uci(&network_uci);
-    // realtek-poe's config, where the device powers ports.
+    // realtek-poe's, dnsmasq's and fw4's configs, where the device has them.
     let poe_config = get("poe").ok();
+    let dhcp_config = get("dhcp").ok();
+    let firewall_config = get("firewall").ok();
+    let mut dhcp = dhcp_config.as_ref().map(|a| Sections::from_uci(a, true));
+    let mut firewall = firewall_config
+        .as_ref()
+        .map(|a| Sections::from_uci(a, false));
+    // A config file isn't a service: pools, reservations and records count only while dnsmasq
+    // runs, and zones only while fw4 is active. The agent never starts either.
+    if let Some(d) = &mut dhcp {
+        d.running = dnsmasq_running(&service(&mut ubus, "dnsmasq"));
+    }
+    if let Some(f) = &mut firewall {
+        f.running = firewall_active(&service(&mut ubus, "firewall"));
+    }
     let poe = poe_config.as_ref().map(Poe::from_uci);
     let board: Value = std::fs::read_to_string("/etc/board.json")
         .ok()
@@ -236,17 +265,24 @@ pub fn stage(state: &State, config: &Value, rollback: Duration) -> Result<Staged
             network: &network,
             ports: &Ports::from_board(&board),
             poe: poe.as_ref(),
+            dhcp: dhcp.as_ref(),
+            firewall: firewall.as_ref(),
         },
     );
     if plan.ops.is_empty() {
         return nothing(plan, Transaction::pending);
     }
-    let configs: &[&str] = if poe.is_some() {
-        &["network", "wireless", "poe"]
-    } else {
-        &["network", "wireless"]
-    };
-    let mut t = Transaction::open(configs).map_err(|e| e.to_string())?;
+    let mut configs = vec!["network", "wireless"];
+    for (name, present) in [
+        ("poe", poe.is_some()),
+        ("dhcp", dhcp.is_some()),
+        ("firewall", firewall.is_some()),
+    ] {
+        if present {
+            configs.push(name);
+        }
+    }
+    let mut t = Transaction::open(&configs).map_err(|e| e.to_string())?;
     for op in &plan.ops {
         match op {
             Op::Add {
@@ -269,10 +305,17 @@ pub fn stage(state: &State, config: &Value, rollback: Duration) -> Result<Staged
         }
         .map_err(|e| staging_failed(op, e))?;
     }
-    // Every config staged, read back: poe too, or a change only to it would pass for none.
+    // Every config staged, read back: poe, dhcp and firewall too, or a change only to one of
+    // them would pass for none.
     let mut staged = vec![("network", &network_uci), ("wireless", &current)];
-    if let Some(p) = &poe_config {
-        staged.push(("poe", p));
+    for (name, answer) in [
+        ("poe", &poe_config),
+        ("dhcp", &dhcp_config),
+        ("firewall", &firewall_config),
+    ] {
+        if let Some(a) = answer {
+            staged.push((name, a));
+        }
     }
     if unchanged(&mut t, &staged)? {
         // Every value was already what the plan sets.

@@ -47,6 +47,8 @@ fn plan_for(config: &Value, network: &Network) -> Plan {
             network,
             ports: &ports(),
             poe: None,
+            dhcp: None,
+            firewall: None,
         },
     )
 }
@@ -207,8 +209,9 @@ fn untagged_ports_must_be_free() {
     );
 }
 
-/// Nothing in `ipv4` is dropped: at this stage every interface keeps the device's own
-/// addressing, so anything `ipv4` asks for is refused, and only what asks nothing passes.
+/// Nothing in the lan's `ipv4` is dropped: the device's own network keeps its addressing, so
+/// anything it asks for is refused, and only what asks nothing passes. (A VLAN Steward makes
+/// is addressed: tests/routed.rs.)
 #[test]
 fn any_addressing_asked_for_is_refused() {
     for ipv4 in [
@@ -223,18 +226,15 @@ fn any_addressing_asked_for_is_refused() {
         json!({ "anything": 1 }),
         json!({ "addressing": "none", "send-hostname": false }),
     ] {
-        for vlan in [None, Some(20)] {
-            let mut iface = json!({ "name": "N", "ipv4": ipv4 });
-            if let Some(id) = vlan {
-                iface["vlan"] = json!({ "id": id });
-            }
-            let plan = plan_for(&json!({ "interfaces": [iface] }), &network());
-            let r = reasons(&plan);
-            assert!(
-                r.iter().any(|r| r.contains("routed interfaces")),
-                "{ipv4} on {vlan:?}: {r:?}"
-            );
-        }
+        let plan = plan_for(
+            &json!({ "interfaces": [{ "name": "N", "ipv4": ipv4 }] }),
+            &network(),
+        );
+        let r = reasons(&plan);
+        assert!(
+            r.iter().any(|r| r.contains("keeps its addressing")),
+            "{ipv4}: {r:?}"
+        );
     }
     for ipv4 in [
         json!({}),
@@ -260,18 +260,18 @@ fn what_it_cant_do_comes_back_as_rejections() {
     ]});
     let plan = plan_for(&config, &network());
     let r = reasons(&plan);
-    // Routed: the addressing is refused, the layer-2 network still made.
-    assert!(r.iter().any(|r| r.contains("routed interfaces")), "{r:?}");
-    // A DHCP client or reservations on a VLAN are addressing too, not supported in this era.
-    for ipv4 in [
-        json!({ "addressing": "dynamic" }),
-        json!({ "dhcp-leases": [{ "macaddr": "00:00:5e:00:53:01", "static-lease-offset": 10 }] }),
-    ] {
-        let config = json!({ "interfaces": [{ "name": "V", "vlan": { "id": 60 }, "ipv4": ipv4 }] });
-        let plan = plan_for(&config, &network());
-        let r = reasons(&plan);
-        assert!(r.iter().any(|r| r.contains("routed interfaces")), "{r:?}");
-    }
+    // Routed: addressed, but no DHCP on a device without dnsmasq, and no zone without fw4
+    // (tests/routed.rs has the rest).
+    assert!(
+        r.iter()
+            .any(|r| r.contains("dnsmasq isn't running on this device")),
+        "{r:?}"
+    );
+    assert!(r.iter().any(|r| r.contains("isn't filtered")), "{r:?}");
+    assert_eq!(
+        values(find(&plan, "stw_vlan50").unwrap())["ipaddr"],
+        "198.51.100.1/24"
+    );
     assert_eq!(
         values(find(&plan, "stw_0_0_5g").unwrap())["network"],
         "stw_vlan50"

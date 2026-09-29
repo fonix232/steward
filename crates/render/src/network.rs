@@ -9,6 +9,7 @@
 //!   selects (all bridge ports by default), and an owned interface `stw_vlan<vid>`
 //!   (proto none) unless one already sits on `<bridge>.<vid>`.
 
+use crate::routed::{self, Sections};
 use crate::{MARKER, PREFIX, Plan, options_of, reject, unsupported};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -83,6 +84,9 @@ pub struct Network {
     pub vlans: BTreeMap<u16, Vlan>,
     /// interface section → its device
     pub interfaces: BTreeMap<String, String>,
+    /// Each static interface's IPv4 addressing as its config gives it: `ipaddr` (one or more,
+    /// each an address or CIDR) and `netmask`. A routed network's subnet must stay clear of it.
+    pub addresses: BTreeMap<String, (Vec<String>, Option<String>)>,
     /// (section, type) the agent owns.
     pub owned: Vec<(String, String)>,
     /// The options each owned section has now.
@@ -139,6 +143,12 @@ impl Network {
                     if let Some(dev) = s["device"].as_str() {
                         n.interfaces.insert(name.clone(), dev.to_owned());
                     }
+                    if s["proto"] == "static" {
+                        n.addresses.insert(
+                            name.clone(),
+                            (list(&s["ipaddr"]), s["netmask"].as_str().map(str::to_owned)),
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -172,7 +182,7 @@ impl Network {
         n
     }
 
-    fn is_owned(&self, section: &str) -> bool {
+    pub(crate) fn is_owned(&self, section: &str) -> bool {
         self.owned.iter().any(|(s, _)| s == section)
     }
 
@@ -354,11 +364,16 @@ const VLAN_KEYS: [&str; 2] = ["id", "proto"];
 const ETHERNET_KEYS: [&str; 2] = ["select-ports", "vlan-tag"];
 
 /// The networks: for each uCentral interface, the network its SSIDs join (`None` when it was
-/// refused), and the owned network sections the configuration needs.
+/// refused), and the owned network sections the configuration needs. The `dhcp` and
+/// `firewall` sections routed networks need go into `other`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn networks(
     config: &Value,
     current: &Network,
     ports: &Ports,
+    dhcp: Option<&Sections>,
+    firewall: Option<&Sections>,
+    other: &mut Vec<(String, String)>,
     plan: &mut Plan,
 ) -> (Vec<Option<String>>, Vec<String>) {
     let mut by_interface = vec![];
@@ -366,6 +381,8 @@ pub(crate) fn networks(
     let mut vids = vec![];
     // Ports this configuration makes untagged, by VLAN.
     let mut untagged_here: Vec<(u16, String)> = vec![];
+    // Subnets a routed network must stay clear of: the device's others, then its own.
+    let mut taken = routed::taken(current);
     let Some(interfaces) = config.get("interfaces").and_then(Value::as_array) else {
         return (by_interface, wanted);
     };
@@ -403,22 +420,24 @@ pub(crate) fn networks(
                 Some(Err(()))
             }
         };
-        // The device's own addressing stays: routing and DHCP serving are the gateway's tasks.
-        // Only `addressing: none` asks nothing, with TIP's default `send-hostname: true`
-        // (netifd's own default too); anything else in `ipv4` would be dropped, answered 0.
+        // Addressing is for the networks Steward makes: the device's own `lan` and the
+        // networks it joins keep theirs. Only `addressing: none` asks nothing of them, with
+        // TIP's default `send-hostname: true` (netifd's own default too).
         let asks_nothing = |(k, v): (&String, &Value)| {
             (k == "addressing" && v == "none") || (k == "send-hostname" && *v == true)
         };
-        if let Some(ipv4) = iface.get("ipv4")
-            && ipv4.as_object().is_none_or(|o| !o.iter().all(asks_nothing))
-        {
-            reject(
-                plan,
-                &format!("{at}/ipv4"),
-                ipv4,
-                "routed interfaces and DHCP serving aren't supported yet; the device keeps its own addressing",
-            );
-        }
+        let keeps_its_own = |plan: &mut Plan, network: &str| {
+            if let Some(ipv4) = iface.get("ipv4")
+                && ipv4.as_object().is_none_or(|o| !o.iter().all(asks_nothing))
+            {
+                reject(
+                    plan,
+                    &format!("{at}/ipv4"),
+                    ipv4,
+                    format!("{network} is the device's own network and keeps its addressing"),
+                );
+            }
+        };
         let Some(vlan) = iface.get("vlan") else {
             // The device's own lan keeps its ports: ports asked of it select nothing.
             if let Some(Ok(_)) = ethernet {
@@ -429,6 +448,7 @@ pub(crate) fn networks(
                     "an interface without a VLAN is the device's own lan, whose ports stay as they are",
                 );
             }
+            keeps_its_own(plan, "lan");
             by_interface.push(Some("lan".to_string()));
             continue;
         };
@@ -565,15 +585,18 @@ pub(crate) fn networks(
             .find(|(n, d)| **d == device && !current.is_owned(n))
         {
             // Someone else's interface on the VLAN: joined as it is.
-            Some((n, _)) => n.clone(),
+            Some((n, _)) => {
+                keeps_its_own(plan, n);
+                n.clone()
+            }
             None => {
                 let name = format!("{PREFIX}vlan{vid}");
-                current.put(
-                    plan,
-                    "interface",
-                    &name,
-                    section(&[("device", json!(device)), ("proto", json!("none"))]),
+                let mut values = routed::ipv4(
+                    &at, iface, vid, &name, dhcp, firewall, &mut taken, other, plan,
                 );
+                values.insert("device".into(), json!(device));
+                values.insert(MARKER.into(), json!("1"));
+                current.put(plan, "interface", &name, values);
                 wanted.push(name.clone());
                 name
             }

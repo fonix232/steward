@@ -13,11 +13,13 @@
 mod network;
 mod poe;
 mod roaming;
+mod routed;
 mod security;
 
 pub use network::{Network, Ports, Vlan};
 pub use poe::{Poe, PoePort};
 pub use roaming::Usteer;
+pub use routed::{Sections, dnsmasq_running, firewall_active};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use steward_proto::Rejection;
@@ -750,7 +752,7 @@ fn ssids(
 }
 
 /// The top-level keys this renderer handles; any other is rejected.
-const TOP_KEYS: [&str; 4] = ["uuid", "radios", "interfaces", "ethernet"];
+const TOP_KEYS: [&str; 5] = ["uuid", "radios", "interfaces", "ethernet", "dns-records"];
 
 /// Radios, SSIDs on `networks` (by interface), and the owned wireless sections no longer needed.
 /// Top-level keys it doesn't handle are rejected here, as both entry points pass through.
@@ -780,15 +782,42 @@ pub struct Current<'a> {
     pub ports: &'a Ports,
     /// realtek-poe's config; `None` without it.
     pub poe: Option<&'a Poe>,
+    /// dnsmasq's config (`dhcp`), and whether dnsmasq runs; `None` without it.
+    pub dhcp: Option<&'a Sections>,
+    /// fw4's config (`firewall`), and whether fw4 is active; `None` without it.
+    pub firewall: Option<&'a Sections>,
 }
 
-/// A whole configuration: networks and VLANs, radios, SSIDs on their networks, and PoE. The
-/// network changes come first, so a new network exists before an SSID joins it.
+/// A whole configuration: networks and VLANs with their addressing, DHCP and zones, radios,
+/// SSIDs on their networks, PoE, and DNS records. The network changes come first, so a new
+/// network exists before an SSID joins it.
 pub fn render(config: &Value, current: &Current<'_>) -> Plan {
     let mut plan = Plan::default();
-    let (networks, wanted) = network::networks(config, current.network, current.ports, &mut plan);
+    let mut other = vec![];
+    let (networks, wanted) = network::networks(
+        config,
+        current.network,
+        current.ports,
+        current.dhcp,
+        current.firewall,
+        &mut other,
+        &mut plan,
+    );
+    routed::dns_records(config, current.dhcp, &mut other, &mut plan);
     wireless_into(config, current.wireless, &networks, &mut plan);
     poe::ethernet(config, current.poe, current.ports, &mut plan);
+    for (name, sections) in [("dhcp", current.dhcp), ("firewall", current.firewall)] {
+        for stale in sections
+            .into_iter()
+            .flat_map(|s| s.owned.keys())
+            .filter(|s| !other.iter().any(|(c, o)| c == name && o == *s))
+        {
+            plan.ops.push(Op::Delete {
+                config: name.into(),
+                section: stale.clone(),
+            });
+        }
+    }
     for (stale, _) in current
         .network
         .owned

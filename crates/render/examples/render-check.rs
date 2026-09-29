@@ -1,12 +1,16 @@
 //! render-check <config.json> [--hostapd <out.json>]: renders a uCentral configuration against
-//! this device's wireless and network configs and stages the result in an rpcd session of its
-//! own, prints the staged changes (secrets redacted) and the rejections, then discards it all:
-//! nothing is applied, no radio or network reloads.
+//! this device's configs (wireless, network, and poe, dhcp and firewall where it has them) and
+//! whether dnsmasq and fw4 run, as the agent does, and stages the result in an rpcd session of
+//! its own, prints the staged changes (secrets redacted) and the rejections, then discards it
+//! all: nothing is applied, nothing reloads.
 //!
 //! `--hostapd` also writes the SSIDs' planned options, with their bands, for
 //! `.ai/skills/device-testing/hostapd-check.uc`. That file holds the secrets: remove it after.
 use serde_json::{Map, Value, json};
-use steward_render::{Current, Network, Op, Poe, Ports, Usteer, Wireless, render};
+use steward_render::{
+    Current, Network, Op, Poe, Ports, Sections, Usteer, Wireless, dnsmasq_running, firewall_active,
+    render,
+};
 use steward_ubus::Ubus;
 use steward_ubus::uci::Transaction;
 
@@ -16,6 +20,15 @@ fn secret(option: &str) -> bool {
         || option.contains("secret")
         || option.contains("password")
         || option.ends_with("kh")
+}
+
+/// Whether a config's service runs, as it's printed.
+fn state(s: Option<&Sections>, running: &str) -> String {
+    match s {
+        None => "no config".into(),
+        Some(s) if s.running => running.into(),
+        Some(_) => format!("not {running}"),
+    }
 }
 
 fn main() {
@@ -32,14 +45,34 @@ fn main() {
             .unwrap()
     };
     let (wireless, network) = (get("wireless"), get("network"));
-    let poe = ubus
-        .call(
-            "uci",
-            "get",
-            json!({ "config": "poe" }).as_object().unwrap(),
+    let mut read = |name: &str| {
+        ubus.call("uci", "get", json!({ "config": name }).as_object().unwrap())
+            .ok()
+    };
+    let poe = read("poe").map(|p| Poe::from_uci(&p));
+    let mut dhcp = read("dhcp").map(|a| Sections::from_uci(&a, true));
+    let mut firewall = read("firewall").map(|a| Sections::from_uci(&a, false));
+    // As the agent does (steward-agent/src/apply.rs, `service`): dnsmasq counts while it runs,
+    // fw4 while it's active.
+    let mut service = |name: &str| {
+        ubus.call(
+            "service",
+            "list",
+            json!({ "name": name }).as_object().unwrap(),
         )
-        .ok()
-        .map(|p| Poe::from_uci(&p));
+        .unwrap_or_default()
+    };
+    if let Some(d) = &mut dhcp {
+        d.running = dnsmasq_running(&service("dnsmasq"));
+    }
+    if let Some(f) = &mut firewall {
+        f.running = firewall_active(&service("firewall"));
+    }
+    println!(
+        "dnsmasq: {}; firewall (fw4): {}",
+        state(dhcp.as_ref(), "running"),
+        state(firewall.as_ref(), "active")
+    );
     let board: Value =
         serde_json::from_str(&std::fs::read_to_string("/etc/board.json").unwrap()).unwrap();
     let mut current = Wireless::from_uci(&wireless);
@@ -70,6 +103,8 @@ fn main() {
             network: &Network::from_uci(&network),
             ports: &Ports::from_board(&board),
             poe: poe.as_ref(),
+            dhcp: dhcp.as_ref(),
+            firewall: firewall.as_ref(),
         },
     );
     for r in &plan.rejected {
@@ -78,12 +113,17 @@ fn main() {
             None => println!("rejected: {} ({})", r.parameter, r.reason),
         }
     }
-    let configs: &[&str] = if poe.is_some() {
-        &["network", "wireless", "poe"]
-    } else {
-        &["network", "wireless"]
-    };
-    let mut t = Transaction::open(configs).unwrap();
+    let mut configs = vec!["network", "wireless"];
+    for (name, present) in [
+        ("poe", poe.is_some()),
+        ("dhcp", dhcp.is_some()),
+        ("firewall", firewall.is_some()),
+    ] {
+        if present {
+            configs.push(name);
+        }
+    }
+    let mut t = Transaction::open(&configs).unwrap();
     for op in &plan.ops {
         let result = match op {
             Op::Add {

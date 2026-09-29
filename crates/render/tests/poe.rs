@@ -31,6 +31,8 @@ fn plan(config: Value, poe: Option<&Poe>) -> Plan {
             network: &Network::default(),
             ports: &ports(),
             poe,
+            dhcp: None,
+            firewall: None,
         },
     )
 }
