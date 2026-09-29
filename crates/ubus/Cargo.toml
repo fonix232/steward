@@ -1,0 +1,12 @@
+[package]
+name = "steward-ubus"
+description = "A ubus client (OpenWrt's system bus) with no libubus underneath"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true

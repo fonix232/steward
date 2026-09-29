@@ -2,7 +2,7 @@
 
 A free and open-source network controller for OpenWrt, aiming at the experience UniFi gives: install it on the router, and the access points, switches and other OpenWrt devices on the network are adopted and managed from one web interface. Topology, per-device and per-client traffic, and IDS/IPS are part of the plan.
 
-**Status: starting.** The design, the plan (`.ai/plans/roadmap.md`) and the task board (`.ai/kanban/`) are in place. So far there's the cargo workspace and uCentral's message types (`crates/proto`); the agent, the controller and the packages are being brought up. The target is OpenWrt 25.12 and later, with apk packages.
+**Status: starting.** The design, the plan (`.ai/plans/roadmap.md`) and the task board (`.ai/kanban/`) are in place. So far there's the cargo workspace, uCentral's message types (`crates/proto`), and a ubus client in Rust (`crates/ubus`) whose answers match the `ubus` command's on a device; the agent, the controller and the packages are being brought up. The target is OpenWrt 25.12 and later, with apk packages.
 
 ## How it fits together (the design)
 
@@ -11,7 +11,7 @@ A free and open-source network controller for OpenWrt, aiming at the experience 
 - **steward-web** will be the controller's web interface, served by the controller.
 - **steward** installs all three, for the device that hosts the controller.
 
-Agent and controller speak uCentral's protocol (the Telecom Infra Project's OpenLAN): JSON-RPC 2.0 over a WebSocket the device opens to the controller on port 15002. Both are written in Rust; `crates/proto` holds the messages they share.
+Agent and controller speak uCentral's protocol (the Telecom Infra Project's OpenLAN): JSON-RPC 2.0 over a WebSocket the device opens to the controller on port 15002. Both are written in Rust; `crates/proto` holds the messages they share, and `crates/ubus` is the agent's way onto the device's ubus (rpcd's `uci` object included).
 
 ## Building
 

@@ -15,10 +15,10 @@ The agent's way onto the device: a pure-Rust ubus client (no libubus, no bindgen
 
 ## Acceptance criteria
 
-- [ ] Lookup and invoke against ubusd, without libubus
-- [ ] blob/blobmsg encoding matches libubox byte for byte (unit test)
-- [ ] On bifrost, answers equal the `ubus` CLI's, key order included
+- [x] Lookup and invoke against ubusd, without libubus
+- [x] blob/blobmsg encoding matches libubox byte for byte (unit test)
+- [x] On bifrost, answers equal the `ubus` CLI's, key order included
 
 ## Progress
 
-Not started.
+Done.

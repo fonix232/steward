@@ -6,14 +6,13 @@ The project's tasks, one Markdown card each, kept with [kanban](https://github.c
 | --- | --- |
 | [Backlog](backlog/_backlog.md) | 35 |
 | [Next](next/_next.md) | 4 |
-| [Ready to start](todo/_todo.md) | 15 |
+| [Ready to start](todo/_todo.md) | 14 |
 | [In progress](doing/_doing.md) | 0 |
 | [In review](review/_review.md) | 0 |
-| [Done](done/_done.md) | 3 |
+| [Done](done/_done.md) | 4 |
 
 ## Ready to start
 
-- [STW-3](todo/003-ubus-client-in-rust.md): ubus client in Rust
 - [STW-4](todo/004-apply-with-automatic-rollback.md): Apply with automatic rollback
 - [STW-5](todo/005-agent-controller-connection.md): Agent–controller connection
 - [STW-6](todo/006-find-the-controller-automatically.md): Find the controller automatically

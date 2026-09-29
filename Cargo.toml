@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proto"]
+members = ["crates/proto", "crates/ubus"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,5 +11,8 @@ repository = "https://github.com/fonix232/steward"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: ubus and UCI answers keep their order (UCI sections' order is
+# meaningful).
+serde_json = { version = "1", features = ["preserve_order"] }
 steward-proto = { path = "crates/proto" }
+steward-ubus = { path = "crates/ubus" }
