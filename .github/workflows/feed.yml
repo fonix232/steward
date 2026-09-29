@@ -1,0 +1,122 @@
+name: Package feed
+
+# Builds Steward's packages (apk; OpenWrt 25.12 and later) with the official
+# OpenWrt SDK images, one per package architecture, and on main publishes
+# them as signed feeds on GitHub Pages, one per architecture:
+#
+#   https://fonix232.github.io/steward/apk/<arch>/packages.adb
+#
+# Only the packages that changed are built, for every architecture in
+# .github/scripts/packages.sh, and a package an architecture's repository
+# lacks for that architecture alone (.github/scripts/feed-plan.sh). gh-pages
+# mirrors main (.github/scripts/publish.sh): each of its commits is the whole
+# feed after one run on main (a push), and its body names the pushed head
+# ("Source: main@<sha>"); a package that did not change is carried over as it
+# was published, and a published name-version never changes its bytes. When
+# main is rewritten, gh-pages goes back to the last commit both histories
+# still share. The feed keeps the last few builds of each package, so an
+# earlier one can be reinstalled with `apk add steward-agent=<version>`.
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      rebuild:
+        description: Build every package for every architecture, changed or not (published ones stay as they are)
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# One run at a time per ref, in order: two publishes would race on gh-pages.
+concurrency:
+  group: feed-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      packages: ${{ steps.plan.outputs.packages }}
+      targets: ${{ steps.plan.outputs.targets }}
+      base: ${{ steps.plan.outputs.base }}
+      tip: ${{ steps.plan.outputs.tip }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0          # ancestry checks against what gh-pages was built from
+
+      - name: Choose the packages to build
+        id: plan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          REBUILD: ${{ inputs.rebuild }}
+        run: sh .github/scripts/feed-plan.sh "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.target.arch }})
+    needs: plan
+    if: needs.plan.outputs.packages != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0          # a package's release is the date of its last change
+
+      - name: Build ${{ matrix.target.packages }}
+        env:
+          PACKAGES: ${{ matrix.target.packages }}
+          SDK: ${{ matrix.target.sdk }}
+          STEWARD_ARCH: ${{ matrix.target.arch }}   # sdk-build.sh fails if the SDK builds for another
+        run: |
+          mkdir -p out && chmod 777 out
+          # shellcheck disable=SC2086 # the package list, one argument each
+          docker run --rm -e STEWARD_ARCH -v "$PWD:/feed:ro" -v "$PWD/out:/out" "openwrt/sdk:$SDK-openwrt-25.12" \
+            sh /feed/.github/scripts/sdk-build.sh /feed /out $PACKAGES
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: packages-${{ matrix.target.arch }}
+          path: out/
+
+  publish:
+    name: Publish to GitHub Pages
+    needs: [plan, build]
+    # Also when nothing was built: every run on main gets its gh-pages commit.
+    # Not when a build failed.
+    if: >-
+      !failure() && !cancelled()
+      && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v7
+        if: needs.plan.outputs.packages != ''
+        with:
+          pattern: packages-*
+          merge-multiple: true    # each holds out/<arch>/: together, one directory per architecture
+          path: ${{ runner.temp }}/new
+
+      - name: Publish main@${{ github.sha }}
+        env:
+          APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
+          BASE: ${{ needs.plan.outputs.base }}
+          TIP: ${{ needs.plan.outputs.tip }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          git fetch --quiet origin "+refs/heads/gh-pages:refs/remotes/origin/gh-pages" 2>/dev/null || true
+          sh .github/scripts/publish.sh "$GITHUB_SHA" "$RUNNER_TEMP/new"

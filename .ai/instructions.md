@@ -15,7 +15,8 @@ steward/              package: installs the other three
 steward.mk            shared by the Makefiles: version, release, how the workspace reaches the build
 feed/                 the feed's public key and its GitHub Pages page
 .github/scripts/      packages.sh (packages, architectures, pkg_inputs), feed-plan.sh, sdk-build.sh, publish.sh
-.github/workflows/    feed.yml (build, publish), test.yml (cargo, shellcheck)
+.github/tests/        feed-scripts.sh: feed-plan.sh and publish.sh against a throwaway origin
+.github/workflows/    feed.yml (build, publish), test.yml (cargo, shellcheck, the feed scripts)
 .ai/                  this file, agents/, skills/, plans/, kanban/ (the board); local/ is untracked
 ```
 
@@ -32,7 +33,8 @@ feed/                 the feed's public key and its GitHub Pages page
 ## Build and test
 
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
-- `shellcheck -s sh -x .github/scripts/*.sh`. CI runs the newest shellcheck, which flags more than older releases: locally, run `docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:latest -s sh -x .github/scripts/*.sh`.
+- `shellcheck -s sh -x .github/scripts/*.sh .github/tests/*.sh`. CI runs the newest shellcheck, which flags more than older releases: locally, run `docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:latest -s sh -x .github/scripts/*.sh .github/tests/*.sh`.
+- The feed's plan and publish scripts: `sh .github/tests/feed-scripts.sh` (docker, seconds).
 - One architecture's packages in the official SDK image: `.ai/skills/package-feed` (about 15 minutes under emulation on Apple Silicon).
 - On a real device: `.ai/skills/device-testing`. Wire formats and ubus behaviour are settled there, not by reasoning.
 - CI failure: `gh run list -R fonix232/steward`, then `gh run view <id> --log-failed`. Don't guess.
@@ -46,7 +48,7 @@ feed/                 the feed's public key and its GitHub Pages page
   - Board upkeep (new cards, reordering, the user's moves) never gets a ticket. It's committed on its own as `Board: <what changed>`, when the user asks.
 - One commit per task. The subject starts with the ticket (`STW-9: Encrypted device channel`), and the body says what changed and how it was verified. No Co-Authored-By or other AI attribution trailers. Push only when asked.
 - The feed publishes from CI only. gh-pages mirrors main, one commit per push to main, carrying `Source: main@<sha>` for the pushed head. There are no tags or releases. The signing key's private half is the `APK_SIGN_KEY` repository secret (with a copy in `~/.config/steward-feed/`), and its public half is `feed/steward.pem`.
-- Every package has the cargo workspace's version. Its release is the date of the last main commit that changed its inputs, so a new file a package is built from goes into `pkg_inputs` in `packages.sh`.
+- Every package has the cargo workspace's version. Its release is the date of the last main commit that changed its inputs, so a new file a package is built from goes into `pkg_inputs` in `packages.sh`. A published name-version never changes its bytes: a rebuild gets a new release, and the feed never replaces a published file.
 - This repository is public: never commit real IPs, MACs, serials or keys.
   - Placeholders: `192.0.2.N` (management LAN), `198.51.100.N` (other networks), `00:00:5e:00:53:XX` (MACs).
   - A device's serial is its MAC without separators, so redact it from logs as `<serial>`.

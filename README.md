@@ -13,9 +13,56 @@ A free and open-source network controller for OpenWrt, aiming at the experience 
 
 Agent and controller speak uCentral's protocol (the Telecom Infra Project's OpenLAN): JSON-RPC 2.0 over a WebSocket the device opens to the controller on port 15002. Both are written in Rust; `crates/proto` holds the messages they share, and `crates/ubus` is the agent's way onto the device's ubus (rpcd's `uci` object included).
 
+## Install (OpenWrt 25.12 and later)
+
+The packages are apk only. On the device that hosts the controller:
+
+    wget -O /etc/apk/keys/steward.pem https://fonix232.github.io/steward/steward.pem
+    apk add -X https://fonix232.github.io/steward/apk/$(cat /etc/apk/arch)/packages.adb steward
+
+On every other device, install `steward-agent` instead. The agent adds the feed to the device, so later versions arrive with `apk upgrade`.
+
+The feed has one repository per package architecture:
+
+| Architecture | Built with the SDK of | Covers, for example |
+|---|---|---|
+| `aarch64_cortex-a53` | mediatek/filogic | MediaTek MT7622/MT798x, Qualcomm IPQ807x |
+| `arm_cortex-a7_neon-vfpv4` | ipq40xx/generic | Qualcomm IPQ40xx |
+| `mipsel_24kc` | ramips/mt7621 | MediaTek MT7621 |
+| `x86_64` | x86/64 | PCs, virtual machines |
+
+## Repository layout
+
+    Cargo.toml            the cargo workspace; its version is every package's
+    crates/proto/         uCentral's messages, shared by agent and controller
+    crates/ubus/          a ubus client in Rust (no libubus), for the agent
+    steward-agent/        package: Makefile, Rust crate, files/ (init, UCI config)
+    steward-controller/   package: Makefile, Rust crate, files/
+    steward-web/          package: the web interface (www/)
+    steward/              package: the collection
+    steward.mk            what the packages' Makefiles share (version, release, cargo)
+    feed/                 the feed's signing key (public half) and its GitHub Pages page
+    .github/scripts/      the feed's build and publish scripts (packages.sh lists packages and architectures)
+    .github/tests/        the feed scripts' test, against a throwaway origin
+    .ai/                  AI tooling: instructions (instructions.md), skills, agents, plans, and the task board (kanban/)
+
 ## Building
 
-Tests: `cargo test`, `cargo clippy --all-targets`, `cargo fmt --check`.
+Tests: `cargo test`, `cargo clippy --all-targets`, `cargo fmt --check`, and for the feed's scripts `sh .github/tests/feed-scripts.sh` (needs docker).
+
+Packages: the Makefiles are ordinary OpenWrt package Makefiles, built with `lang/rust`'s `rust-package.mk` from the packages feed. Add the repository as a feed in a 25.12 SDK or buildroot (`src-link steward /path/to/steward`) and build `package/steward-agent/compile` and the rest; `rust/host` is built first.
+
+The feed's CI builds each architecture in the official SDK image (`openwrt/sdk:<target>-openwrt-25.12`) with `.github/scripts/sdk-build.sh`. It uses rustup's prebuilt toolchain instead of `rust/host`, which builds rustc and LLVM from source, and keeps everything else of `rust-package.mk`: the target triple, and the SDK's gcc as the linker, so the binaries link against the device's musl. For MIPS, which rustup ships no standard library for, it builds the standard library on nightly.
+
+To build one architecture locally:
+
+    mkdir -p out && chmod 777 out
+    docker run --rm -v "$PWD:/feed:ro" -v "$PWD/out:/out" openwrt/sdk:mediatek-filogic-openwrt-25.12 \
+        sh /feed/.github/scripts/sdk-build.sh /feed /out
+
+## The feed
+
+`.github/workflows/feed.yml` builds only the packages whose inputs changed (`.github/scripts/feed-plan.sh`), for every architecture, and publishes them on GitHub Pages as signed apk repositories. The `gh-pages` branch mirrors `main`: each of its commits is the whole feed after one push to `main`, named after the pushed head in a `Source: main@<sha>` line. A package's release number is the UTC date of the last `main` commit that changed what it is built from (its build script included), so it goes up as long as `main`'s commit dates do (the feed refuses to publish an older build), and a published version never changes: the feed never replaces a published file. There are no tags or releases; the feed keeps the last five builds of each package.
 
 ## License
 

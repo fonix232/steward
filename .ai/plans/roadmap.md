@@ -1,13 +1,13 @@
 # Roadmap
 
-## Bring-up
+## Done
 
-1. The cargo workspace and uCentral's messages (`crates/proto`).
-2. `crates/ubus`: a ubus client, and `uci::Transaction` (an rpcd session with rollback and confirm), checked on the test AP.
-3. The connection loop:
-   - the agent: connect, state every minute, reconnects with backoff, and finds the controller on the default gateway
-   - the controller: device registry, provisioning a stored configuration by uuid
-4. The packages (`steward`, `steward-agent`, `steward-controller`, `steward-web`) and the signed per-architecture feed on gh-pages: aarch64_cortex-a53, arm_cortex-a7_neon-vfpv4, mipsel_24kc, x86_64.
+- Packages (`steward`, `steward-agent`, `steward-controller`, `steward-web`) and the signed per-architecture feed on gh-pages: aarch64_cortex-a53, arm_cortex-a7_neon-vfpv4, mipsel_24kc, x86_64.
+- `crates/proto`: uCentral's messages.
+- `crates/ubus`: a ubus client, and `uci::Transaction` (an rpcd session with rollback and confirm). Checked on bifrost.
+- The connection loop:
+  - the agent: connect, state every minute, reconnects with backoff, and finds the controller on the default gateway
+  - the controller: device registry, provisioning a stored configuration by uuid
 
 ## Next, in order
 

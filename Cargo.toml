@@ -19,3 +19,6 @@ steward-ubus = { path = "crates/ubus" }
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "io-util"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+# The OpenWrt build (rust-package.mk) sets its own release profile: size
+# first, LTO, one codegen unit.
