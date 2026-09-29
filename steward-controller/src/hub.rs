@@ -134,6 +134,35 @@ impl Hub {
         Value::Object(out)
     }
 
+    /// Every client of the adopted devices, from the connected ones' latest states; every
+    /// adopted device's own MACs are left out (`clients::merge`).
+    pub async fn clients(&self) -> Value {
+        let reg = self.registry.lock().await;
+        let null = Value::Null;
+        let reports: Vec<crate::clients::Report> = reg
+            .devices
+            .all()
+            .iter()
+            .filter(|(_, r)| r.standing == Standing::Adopted)
+            .map(|(serial, r)| {
+                let latest = reg.states.get(serial);
+                let capabilities = r
+                    .capabilities
+                    .as_ref()
+                    .or(reg.connected.get(serial).map(|d| &d.capabilities))
+                    .unwrap_or(&null);
+                crate::clients::Report {
+                    serial,
+                    capabilities,
+                    state: latest.map_or(&null, |l| &l.state),
+                    received: latest.map_or(0, |l| l.received),
+                    connected: reg.connected.contains_key(serial),
+                }
+            })
+            .collect();
+        Value::Array(crate::clients::merge(&reports))
+    }
+
     /// The controller is stopping: the connected devices were last seen now, and every
     /// changed state is written.
     pub async fn stop(&self) {
@@ -428,6 +457,31 @@ mod tests {
         assert!(!dir.join("state").join(format!("{SERIAL}.json")).exists());
         assert!(!dir.join("configs").join(format!("{SERIAL}.json")).exists());
         assert!(open(&dir).devices().await.get(SERIAL).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An adopted device that isn't connected has a stored state, but its clients aren't
+    /// known any more.
+    #[tokio::test]
+    async fn an_offline_devices_clients_arent_listed() {
+        let dir = std::env::temp_dir().join(format!("steward-hub-clients-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = open(&dir);
+        {
+            let mut reg = hub.registry.lock().await;
+            let d = &mut reg.devices;
+            d.admit(SERIAL, None, Some("E8450"), "OpenWrt", |_| false)
+                .unwrap();
+            d.adopt(SERIAL).unwrap();
+            d.issue(SERIAL).unwrap();
+            d.delivered(SERIAL, false).unwrap();
+            let state = json!({ "interfaces": [{ "name": "lan",
+                "ssids": [{ "ssid": "Home", "iface": "wl0-ap0", "associations": [
+                    { "station": "00:00:5e:00:53:21", "inactive": 0 }] }],
+                "clients": [{ "mac": "00:00:5e:00:53:31", "ports": ["lan1"] }] }] });
+            reg.states.record(SERIAL, 0, state, true);
+        }
+        assert_eq!(hub.clients().await, json!([]));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

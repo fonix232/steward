@@ -28,8 +28,14 @@ pub fn identity() -> Result<proto::Connect, steward_ubus::Error> {
     })
 }
 
-/// A subset of uCentral's capabilities document: what the device is and
-/// which ports it has.
+/// An interface's MAC address, from sysfs.
+fn mac_of(ifname: &str) -> Option<String> {
+    let a = std::fs::read_to_string(format!("/sys/class/net/{ifname}/address")).ok()?;
+    Some(a.trim().to_lowercase()).filter(|a| a.len() == 17)
+}
+
+/// A subset of uCentral's capabilities document: what the device is, which ports it has,
+/// and its own MAC addresses (so the controller can tell it from a client).
 fn capabilities(board: &Map<String, Value>, board_json: &Value) -> Value {
     let mut network = Map::new();
     if let Some(nets) = board_json.get("network").and_then(Value::as_object) {
@@ -45,8 +51,23 @@ fn capabilities(board: &Map<String, Value>, board_json: &Value) -> Value {
             network.insert(role.clone(), Value::Array(ports));
         }
     }
+    let first = |role: &str| -> Option<String> {
+        let net = board_json.get("network")?.get(role)?;
+        net.get("device")
+            .or_else(|| net.get("ports")?.get(0))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let mut macaddr = Map::new();
+    if let Some(mac) = mac_of("br-lan").or_else(|| first("lan").and_then(|p| mac_of(&p))) {
+        macaddr.insert("lan".into(), json!(mac));
+    }
+    if let Some(mac) = first("wan").and_then(|p| mac_of(&p)) {
+        macaddr.insert("wan".into(), json!(mac));
+    }
     json!({
         "compatible": board.get("board_name").and_then(Value::as_str).unwrap_or_default().replace(',', "_"),
+        "macaddr": macaddr,
         "model": board.get("model"),
         "platform": if board_json.get("wlan").is_some_and(|w| w.as_object().is_some_and(|w| !w.is_empty())) { "ap" } else { "unknown" },
         "network": network,

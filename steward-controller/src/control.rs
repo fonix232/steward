@@ -1,5 +1,5 @@
 //! The controller's local control socket, `/var/run/steward-controller.sock` (root only), and the
-//! command-line side of it: `steward-controller devices | adopt <serial> | forget <serial>`.
+//! command-line side of it: `steward-controller devices | clients | adopt <serial> | forget <serial>`.
 //! One JSON request per line, one JSON answer per line. The web interface will call the same
 //! operations through its API.
 
@@ -13,6 +13,7 @@ use std::path::Path;
 #[serde(tag = "cmd", rename_all = "lowercase")]
 pub enum Request {
     Devices,
+    Clients,
     Adopt { serial: String },
     Forget { serial: String },
 }
@@ -24,6 +25,8 @@ pub struct Answer {
     pub message: String,
     #[serde(default)]
     pub devices: Value,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub clients: Value,
 }
 
 impl Answer {
@@ -32,6 +35,7 @@ impl Answer {
             ok: true,
             message: message.into(),
             devices: Value::Null,
+            clients: Value::Null,
         }
     }
     pub fn error(message: impl Into<String>) -> Answer {
@@ -39,6 +43,7 @@ impl Answer {
             ok: false,
             message: message.into(),
             devices: Value::Null,
+            clients: Value::Null,
         }
     }
 }
@@ -124,21 +129,74 @@ pub fn client(socket: &Path, req: Request, json: bool) -> i32 {
             return 1;
         }
     };
-    if json {
-        let shown = if answer.devices.is_null() {
-            serde_json::to_value(&answer).unwrap_or_default()
-        } else {
+    let lines = if json {
+        let shown = if !answer.clients.is_null() {
+            answer.clients.clone()
+        } else if !answer.devices.is_null() {
             answer.devices.clone()
+        } else {
+            serde_json::to_value(&answer).unwrap_or_default()
         };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&shown).unwrap_or_default()
-        );
-        return if answer.ok { 0 } else { 1 };
+        vec![serde_json::to_string_pretty(&shown).unwrap_or_default()]
+    } else {
+        listing(&answer)
+    };
+    if let Err(e) = print(&mut std::io::stdout().lock(), &lines) {
+        eprintln!("steward-controller: {e}");
+        return 1;
+    }
+    if answer.ok { 0 } else { 1 }
+}
+
+/// Prints the lines. A reader that stops reading (`steward-controller clients | head`) ends
+/// the printing quietly, where println! would panic; other errors are returned.
+fn print(out: &mut impl Write, lines: &[String]) -> std::io::Result<()> {
+    let written = lines
+        .iter()
+        .try_for_each(|l| writeln!(out, "{l}"))
+        .and_then(|_| out.flush());
+    match written {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        r => r,
+    }
+}
+
+/// The answer, for people: clients, devices, then the message.
+fn listing(answer: &Answer) -> Vec<String> {
+    let mut lines = vec![];
+    if let Value::Array(clients) = &answer.clients {
+        if clients.is_empty() {
+            lines.push("No clients.".to_string());
+        }
+        for c in clients {
+            let w = &c["connection"];
+            let place = match w["type"].as_str() {
+                Some("wireless") => format!(
+                    "{} {} {} {} dBm",
+                    w["device"].as_str().unwrap_or("?"),
+                    w["ssid"].as_str().unwrap_or("?"),
+                    w["band"].as_str().unwrap_or("?"),
+                    w["signal"]
+                ),
+                Some("wired") => format!(
+                    "{} {}",
+                    w["device"].as_str().unwrap_or("?"),
+                    w["port"].as_str().unwrap_or("?")
+                ),
+                _ => "-".into(),
+            };
+            lines.push(format!(
+                "{}  {:<20} {:<15} {:<10} {place}",
+                c["mac"].as_str().unwrap_or("?"),
+                c["name"].as_str().unwrap_or("-"),
+                c["ipv4"][0].as_str().unwrap_or("-"),
+                c["network"].as_str().unwrap_or("-"),
+            ));
+        }
     }
     if let Value::Object(devices) = &answer.devices {
         if devices.is_empty() {
-            println!("No device has connected yet.");
+            lines.push("No device has connected yet.".to_string());
         }
         for (serial, d) in devices {
             let connection = match (d["connected"].as_bool(), d["last_seen"].as_u64()) {
@@ -146,17 +204,81 @@ pub fn client(socket: &Path, req: Request, json: bool) -> i32 {
                 (_, Some(t)) => format!("seen {} ago", ago(t)),
                 _ => "offline".to_string(),
             };
-            println!(
+            lines.push(format!(
                 "{serial}  {:<9} {:<14} {}  {}",
                 d["standing"].as_str().unwrap_or("?"),
                 connection,
                 d["model"].as_str().unwrap_or("-"),
                 d["firmware"].as_str().unwrap_or("-"),
-            );
+            ));
         }
     }
     if !answer.message.is_empty() {
-        println!("{}", answer.message);
+        lines.push(answer.message.clone());
     }
-    if answer.ok { 0 } else { 1 }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::ErrorKind;
+
+    /// A reader that takes `room` bytes, then fails with `kind`.
+    struct Reader {
+        room: usize,
+        kind: ErrorKind,
+        got: Vec<u8>,
+    }
+
+    impl Write for Reader {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.got.len() + buf.len() > self.room {
+                return Err(self.kind.into());
+            }
+            self.got.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn printing_stops_quietly_when_the_reader_goes() {
+        let answer = Answer {
+            clients: json!([
+                { "mac": "00:00:5e:00:53:21", "name": "phone", "ipv4": ["192.0.2.21"], "network": "lan",
+                  "connection": { "type": "wireless", "device": "00005e0053a0", "ssid": "Home",
+                                  "band": "5G", "signal": -40 } },
+                { "mac": "00:00:5e:00:53:31", "ipv4": [], "network": "lan",
+                  "connection": { "type": "wired", "device": "00005e0053a0", "port": "lan1" } }
+            ]),
+            ..Answer::ok("")
+        };
+        let lines = listing(&answer);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].ends_with("00005e0053a0 Home 5G -40 dBm"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].ends_with("00005e0053a0 lan1"), "{}", lines[1]);
+        // `clients | head -1`: the reader takes the first line and closes the pipe.
+        let mut head = Reader {
+            room: lines[0].len() + 1,
+            kind: ErrorKind::BrokenPipe,
+            got: vec![],
+        };
+        assert!(print(&mut head, &lines).is_ok());
+        assert_eq!(head.got, format!("{}\n", lines[0]).into_bytes());
+        // Any other failure is still one.
+        let mut full = Reader {
+            room: 0,
+            kind: ErrorKind::Other,
+            got: vec![],
+        };
+        assert!(print(&mut full, &lines).is_err());
+    }
 }

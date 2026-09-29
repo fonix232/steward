@@ -382,6 +382,10 @@ async fn logout(State(api): State<Api>, headers: HeaderMap) -> Response {
     r
 }
 
+async fn clients(State(api): State<Api>) -> Json<Value> {
+    Json(json!({ "clients": api.hub.clients().await }))
+}
+
 async fn devices(State(api): State<Api>) -> Json<Value> {
     Json(json!({ "devices": api.hub.devices().await }))
 }
@@ -465,6 +469,7 @@ pub fn router(hub: Arc<Hub>, auth: Arc<dyn Auth>) -> Router {
     let api = Api { hub, auth };
     let protected = Router::new()
         .route("/api/devices", get(devices))
+        .route("/api/clients", get(clients))
         .route("/api/devices/{serial}/adopt", post(adopt))
         .route("/api/devices/{serial}/forget", post(forget))
         .route(
@@ -738,6 +743,10 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(
+            call(&app, "GET", "/api/clients", None, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
             call(&app, "GET", "/api/devices", Some("forged"), None)
                 .await
                 .0,
@@ -767,6 +776,9 @@ mod tests {
         let t = Some("t0k3n");
         let (_, _, body) = call(&app, "GET", "/api/devices", t, None).await;
         assert_eq!(body["devices"][SERIAL]["standing"], "pending");
+        // No adopted device has reported yet: no clients.
+        let (_, _, clients) = call(&app, "GET", "/api/clients", t, None).await;
+        assert_eq!(clients, json!({ "clients": [] }));
         assert_eq!(body["devices"][SERIAL]["connected"], false);
         assert_eq!(body["devices"][SERIAL]["model"], "E8450");
 

@@ -23,6 +23,7 @@
 //! `Authorization: Bearer` on the WebSocket upgrade.
 
 mod apply;
+mod clients;
 mod device;
 mod state;
 

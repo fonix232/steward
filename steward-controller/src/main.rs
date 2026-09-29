@@ -22,6 +22,7 @@ macro_rules! log {
 pub(crate) use log;
 
 mod api;
+mod clients;
 mod control;
 mod devices;
 mod hub;
@@ -82,7 +83,7 @@ const LOG_TEXT: usize = 128;
 const TOO_MANY_PENDING: &str = "too many devices waiting for adoption";
 
 const USAGE: &str = "usage: steward-controller [--listen <address:port>] [--web-listen <address:port>] [--state-dir <dir>] [--config-dir <dir>] [--control <socket>] [--plaintext] [--adopt-local]
-       steward-controller [--control <socket>] [--json] devices | adopt <serial> | forget <serial>";
+       steward-controller [--control <socket>] [--json] devices | clients | adopt <serial> | forget <serial>";
 
 struct Args {
     listen: String,
@@ -135,6 +136,7 @@ impl Args {
                 "--adopt-local" => a.adopt_local = true,
                 "--json" => a.json = true,
                 "devices" => a.command = Some(Request::Devices),
+                "clients" => a.command = Some(Request::Clients),
                 "adopt" => {
                     a.command = Some(Request::Adopt {
                         serial: it.next().unwrap_or_else(|| usage()),
@@ -736,6 +738,13 @@ async fn control_request(req: Request, hub: &Hub) -> Answer {
             ok: true,
             message: String::new(),
             devices: hub.devices().await,
+            clients: Value::Null,
+        },
+        Request::Clients => Answer {
+            ok: true,
+            message: String::new(),
+            devices: Value::Null,
+            clients: hub.clients().await,
         },
         Request::Adopt { serial } => answer(hub.adopt(&serial).await),
         Request::Forget { serial } => answer(hub.forget(&serial).await),

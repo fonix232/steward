@@ -7,10 +7,11 @@
 //! device's. Every field is picked by name, because a wifi-iface's config holds its key:
 //! nothing from a source is copied whole. Rates (CPU load, channel utilisation) cover the
 //! time since the previous report, which [`Previous`] carries. A source that's missing
-//! leaves its part out.
+//! leaves its part out. Who's connected (stations, clients, leases) is `clients`'.
 
+use crate::clients::{self, Fdb, Lease, Neighbour, Seen};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use steward_render::{PREFIX, Ports};
 use steward_ubus::Ubus;
@@ -54,6 +55,18 @@ pub struct Sources {
     /// `network.interface dump`.
     pub interfaces: Value,
     pub ports: Ports,
+    /// `iwinfo assoclist` results, by wireless interface.
+    pub assoc: BTreeMap<String, Value>,
+    /// What the bridges learned.
+    pub fdb: Vec<Fdb>,
+    /// IPv4 neighbours.
+    pub arp: Vec<Neighbour>,
+    /// `luci-rpc getHostHints`.
+    pub hints: Value,
+    /// DHCPv4 leases, where the device serves DHCP.
+    pub leases: Vec<Lease>,
+    /// The default gateway.
+    pub gateway: Option<String>,
 }
 
 /// What the last report's rates start from.
@@ -247,7 +260,7 @@ fn location(section: &str) -> Option<String> {
         .then(|| format!("/interfaces/{i}/ssids/{s}"))
 }
 
-/// The SSIDs on the logical interface `network`.
+/// The SSIDs on the logical interface `network`, with their stations.
 fn ssids(network: &str, s: &Sources, radios: &[Radio]) -> Vec<Value> {
     let mut out = vec![];
     for (n, radio) in radios.iter().enumerate() {
@@ -272,14 +285,70 @@ fn ssids(network: &str, s: &Sources, radios: &[Radio]) -> Vec<Value> {
                 "radio": { "$ref": format!("#/radios/{n}") },
                 "counters": counters(device),
                 "location": iface["section"].as_str().and_then(location),
+                "associations": s.assoc.get(ifname).map(|r| clients::associations(r, &device["macaddr"])),
             }));
         }
     }
     out
 }
 
+/// Every wireless interface's name.
+fn wireless_ifnames(s: &Sources) -> BTreeSet<String> {
+    let radios = s.wireless.as_object().into_iter().flatten();
+    radios
+        .flat_map(|(_, r)| r["interfaces"].as_array().into_iter().flatten())
+        .filter_map(|i| i["ifname"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The logical interface that gets a bridge's MACs no IP places: `lan` when it's on the
+/// bridge, else the first on it. The kernel's brforward has no VLANs.
+fn fdb_home<'a>(s: &'a Sources, seen: &Seen) -> BTreeMap<String, &'a str> {
+    let mut home = BTreeMap::new();
+    for iface in s.interfaces["interface"].as_array().into_iter().flatten() {
+        let (Some(name), Some(l3)) = (iface["interface"].as_str(), iface["l3_device"].as_str())
+        else {
+            continue;
+        };
+        if let Some(bridge) = seen.bridge_of(l3) {
+            let e = home.entry(bridge.to_owned()).or_insert(name);
+            if name == "lan" {
+                *e = name;
+            }
+        }
+    }
+    home
+}
+
+/// The L3 devices of the interfaces that carry a default route, where they aren't on a
+/// bridge: a router's WAN. Everything on them is upstream (the ISP's gateway, a modem), not
+/// a client. On a bridge (an AP's lan), the uplink port tells what's upstream.
+fn upstream<'a>(s: &'a Sources, seen: &Seen) -> BTreeSet<&'a str> {
+    let default = |r: &Value| r["mask"] == 0 && (r["target"] == "0.0.0.0" || r["target"] == "::");
+    s.interfaces["interface"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|i| i["route"].as_array().is_some_and(|r| r.iter().any(default)))
+        .filter_map(|i| i["l3_device"].as_str())
+        .filter(|l3| seen.bridge_of(l3).is_none())
+        .collect()
+}
+
 fn interfaces(s: &Sources, radios: &[Radio]) -> Vec<Value> {
     let mut out = vec![];
+    let mut own: BTreeSet<String> = s
+        .devices
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, d)| d["macaddr"].as_str().map(str::to_lowercase))
+        .collect();
+    own.remove("00:00:00:00:00:00");
+    let seen = Seen::new(&s.fdb, &s.arp, &s.hints, s.gateway.as_deref(), own);
+    let home = fdb_home(s, &seen);
+    let upstream = upstream(s, &seen);
+    let wireless = wireless_ifnames(s);
     let list = s.interfaces["interface"].as_array();
     for iface in list.into_iter().flatten() {
         let Some(name) = iface["interface"].as_str() else {
@@ -304,10 +373,48 @@ fn interfaces(s: &Sources, radios: &[Radio]) -> Vec<Value> {
         let up = iface["up"] == true;
         let l3 = iface["l3_device"].as_str().unwrap_or("");
         let ssids = ssids(name, s, radios);
+        let stations: Vec<(String, String)> = ssids
+            .iter()
+            .flat_map(|ssid| {
+                let ifname = ssid["iface"].as_str().unwrap_or_default().to_owned();
+                let stations = ssid["associations"].as_array().cloned().unwrap_or_default();
+                stations
+                    .into_iter()
+                    .filter_map(move |a| Some((a["station"].as_str()?.to_owned(), ifname.clone())))
+            })
+            .collect();
+        let fdb_only = seen
+            .bridge_of(l3)
+            .is_some_and(|b| home.get(b) == Some(&name));
+        let clients = if l3.is_empty() || upstream.contains(l3) {
+            vec![]
+        } else {
+            seen.clients(l3, &stations, fdb_only, &wireless)
+        };
+        // Leases in this interface's subnets.
+        let subnets: Vec<(&str, u32)> = iface["ipv4-address"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| Some((a["address"].as_str()?, a["mask"].as_u64()? as u32)))
+            .collect();
+        let leases: Vec<Value> = s
+            .leases
+            .iter()
+            .filter(|l| {
+                subnets
+                    .iter()
+                    .any(|(net, p)| clients::in_subnet(&l.ip, net, *p))
+            })
+            .map(|l| json!({ "address": l.ip, "mac": l.mac, "hostname": l.hostname }))
+            .collect();
         out.push(json!({
             "name": name,
             "uptime": if up { iface["uptime"].clone() } else { Value::Null },
-            "ipv4": if ipv4.is_empty() { Value::Null } else { json!({ "addresses": ipv4 }) },
+            "ipv4": if ipv4.is_empty() { Value::Null } else {
+                json!({ "addresses": ipv4, "leases": (!leases.is_empty()).then_some(leases) })
+            },
+            "clients": (!clients.is_empty()).then_some(clients),
             "ipv6_addresses": if ipv6.is_empty() { Value::Null } else { json!(ipv6) },
             "dns_servers": iface["dns-server"].as_array().filter(|d| !d.is_empty()),
             "counters": if l3.is_empty() { Value::Null } else { counters(&s.devices[l3]) },
@@ -476,6 +583,24 @@ pub fn gather() -> Result<Sources, steward_ubus::Error> {
         };
         phys.insert(section.clone(), phy);
     }
+    let assoc = wireless_ifnames(&Sources {
+        wireless: wireless.clone(),
+        ..Default::default()
+    })
+    .into_iter()
+    .map(|ifname| {
+        let results = call("iwinfo", "assoclist", json!({ "device": ifname }))["results"].clone();
+        (ifname, results)
+    })
+    .collect();
+    let hints = call("luci-rpc", "getHostHints", json!({}));
+    // Leases from luci-rpc (dnsmasq's and odhcpd's), else dnsmasq's file.
+    let leases = match call("luci-rpc", "getDHCPLeases", json!({ "family": 4 })) {
+        Value::Null => clients::dnsmasq_leases(
+            &std::fs::read_to_string("/tmp/dhcp.leases").unwrap_or_default(),
+        ),
+        answer => clients::luci_leases(&answer),
+    };
     let board: Value = std::fs::read_to_string("/etc/board.json")
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -493,7 +618,43 @@ pub fn gather() -> Result<Sources, steward_ubus::Error> {
         devices,
         interfaces,
         ports: Ports::from_board(&board),
+        assoc,
+        fdb: bridges_fdb(),
+        arp: clients::arp(&std::fs::read_to_string("/proc/net/arp").unwrap_or_default()),
+        hints,
+        leases,
+        gateway: crate::device::default_gateway().map(|g| g.to_string()),
     })
+}
+
+/// Every bridge's learned MACs, from sysfs.
+fn bridges_fdb() -> Vec<Fdb> {
+    let mut out = vec![];
+    for entry in std::fs::read_dir("/sys/class/net")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let (dir, bridge) = (
+            entry.path(),
+            entry.file_name().to_string_lossy().into_owned(),
+        );
+        let Ok(data) = std::fs::read(dir.join("brforward")) else {
+            continue;
+        };
+        let ports: BTreeMap<u16, String> = std::fs::read_dir(dir.join("brif"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|p| {
+                let n = std::fs::read_to_string(p.path().join("port_no")).ok()?;
+                let n = u16::from_str_radix(n.trim().trim_start_matches("0x"), 16).ok()?;
+                Some((n, p.file_name().to_string_lossy().into_owned()))
+            })
+            .collect();
+        out.extend(clients::brforward(&bridge, &data, &ports));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -591,6 +752,7 @@ mod tests {
                 lan: vec!["lan1".into(), "lan2".into(), "lan3".into(), "lan4".into()],
                 wan: vec!["wan".into()],
             },
+            ..Default::default()
         }
     }
 
@@ -744,6 +906,117 @@ mod tests {
         );
         assert!(down.get("lan2").is_none(), "no such device: left out");
         assert_eq!(doc["link-state"]["upstream"]["wan"]["carrier"], false);
+    }
+
+    #[test]
+    fn stations_clients_and_leases_are_reported() {
+        let mut s = sources();
+        s.assoc.insert(
+            "wl1-ap1".into(),
+            json!([{ "mac": "00:00:5e:00:53:21", "signal": -40, "connected_time": 60, "inactive": 1,
+                     "rx": { "rate": 6000 }, "tx": { "rate": 144400, "mcs": 15 } }]),
+        );
+        let fdb = |mac: &str, port: &str| Fdb {
+            bridge: "br-lan".into(),
+            mac: mac.into(),
+            port: port.into(),
+            local: false,
+        };
+        s.fdb = vec![
+            fdb("00:00:5e:00:53:40", "lan4"), // the gateway: lan4 is the uplink
+            fdb("00:00:5e:00:53:41", "lan4"), // behind the uplink
+            fdb("00:00:5e:00:53:31", "lan1"), // wired, here, no IP seen
+            fdb("00:00:5e:00:53:21", "wl1-ap1"),
+            fdb("00:00:5e:00:53:02", "wl1-ap0"), // a BSSID: the device's own
+        ];
+        s.arp = vec![Neighbour {
+            ip: "192.0.2.1".into(),
+            mac: "00:00:5e:00:53:40".into(),
+            device: "br-lan.1".into(),
+        }];
+        s.gateway = Some("192.0.2.1".into());
+        // An AP's default route is on its bridge: the uplink port tells what's upstream.
+        s.interfaces["interface"][0]["route"] =
+            json!([{ "target": "0.0.0.0", "mask": 0, "nexthop": "192.0.2.1" }]);
+        s.leases = vec![
+            Lease {
+                ip: "192.0.2.50".into(),
+                mac: "00:00:5e:00:53:31".into(),
+                hostname: Some("printer".into()),
+            },
+            Lease {
+                ip: "198.51.100.9".into(),
+                mac: "00:00:5e:00:53:32".into(),
+                hostname: None,
+            },
+        ];
+        let doc = document(&s, &mut Previous::default());
+        let lan = &doc["interfaces"][0];
+        let home = &lan["ssids"][1];
+        assert_eq!(home["associations"][0]["station"], "00:00:5e:00:53:21");
+        assert_eq!(home["associations"][0]["bssid"], "00:00:5e:00:53:03");
+        assert_eq!(home["associations"][0]["tx_rate"]["bitrate"], 144400);
+        let macs: Vec<&str> = lan["clients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["mac"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            macs,
+            ["00:00:5e:00:53:21", "00:00:5e:00:53:31"],
+            "not the gateway, nor what's behind it, nor its own"
+        );
+        assert_eq!(
+            lan["ipv4"]["leases"],
+            json!([{ "address": "192.0.2.50", "mac": "00:00:5e:00:53:31", "hostname": "printer" }])
+        );
+        // The VLAN's interface gets neither lan's FDB-only MACs nor its leases.
+        assert!(doc["interfaces"][1].get("clients").is_none());
+    }
+
+    /// A router's default route is on its WAN, which isn't a bridge, so no uplink port is
+    /// found: the WAN's neighbours (the ISP's gateway, a modem) are upstream, not clients.
+    #[test]
+    fn a_routers_wan_neighbours_are_not_clients() {
+        let neighbour = |ip: &str, mac: &str, device: &str| Neighbour {
+            ip: ip.into(),
+            mac: mac.into(),
+            device: device.into(),
+        };
+        let s = Sources {
+            now: NOW,
+            info: json!({ "uptime": 1 }),
+            interfaces: json!({ "interface": [
+                { "interface": "lan", "up": true, "l3_device": "br-lan",
+                  "ipv4-address": [{ "address": "192.0.2.1", "mask": 24 }] },
+                { "interface": "wan", "up": true, "l3_device": "wan",
+                  "ipv4-address": [{ "address": "198.51.100.2", "mask": 24 }],
+                  "route": [{ "target": "0.0.0.0", "mask": 0, "nexthop": "198.51.100.1" }] },
+                { "interface": "wan6", "up": true, "l3_device": "wan",
+                  "route": [{ "target": "::", "mask": 0, "nexthop": "fe80::1" }] },
+            ]}),
+            fdb: vec![Fdb {
+                bridge: "br-lan".into(),
+                mac: "00:00:5e:00:53:31".into(),
+                port: "lan1".into(),
+                local: false,
+            }],
+            arp: vec![
+                neighbour("198.51.100.1", "00:00:5e:00:53:99", "wan"),
+                neighbour("198.51.100.254", "00:00:5e:00:53:98", "wan"),
+                neighbour("192.0.2.31", "00:00:5e:00:53:31", "br-lan"),
+            ],
+            gateway: Some("198.51.100.1".into()),
+            ..Default::default()
+        };
+        let doc = document(&s, &mut Previous::default());
+        let ifaces = doc["interfaces"].as_array().unwrap();
+        assert_eq!(ifaces[0]["clients"][0]["mac"], "00:00:5e:00:53:31");
+        assert_eq!(ifaces[0]["clients"][0]["ports"], json!(["lan1"]));
+        for wan in &ifaces[1..] {
+            assert!(wan.get("clients").is_none(), "{wan}");
+        }
     }
 
     #[test]

@@ -21,7 +21,7 @@
 4. **steward-web**: devices, adoption, clients, and configuration editing.
 5. **State and topology**:
    - device state: done (STW-18): unit with CPU load and temperatures, radios with channel utilisation, interfaces with their SSIDs, port links
-   - clients (hostapd over ubus)
+   - clients: done (STW-19) in agent and controller (`/api/clients`); the web list comes with the web interface
    - LLDP neighbours (lldpd)
    - per-device and per-client traffic (nlbwmon or conntrack accounting)
    - the topology built from them

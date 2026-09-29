@@ -44,8 +44,25 @@ The agent's `state` event (every minute) follows TIP's `state/*.yml`. `steward-a
 - **`link-state`**: board.json's WAN ports as upstream, LAN ports as downstream: carrier, speed and duplex (netifd's `1000F`), counters.
 - Every field is picked by name: `network.wireless status` includes each SSID's key in its config.
 - Missing sources leave their parts out.
-- About 6 KB a report on bifrost (8 SSIDs, 5 ports).
-- Clients (`associations`) and LLDP peers aren't reported yet.
+- About 11 KB a report on bifrost (8 SSIDs, 5 ports, 10 stations; 6 KB without clients). The controller writes states to flash only on events (STW-14), so the size costs bandwidth, not flash.
+- **Clients** (`steward-agent/src/clients.rs`):
+  - Each SSID's `associations` come from `iwinfo assoclist`: station, rssi, connected (s), inactive (ms, as nl80211 gives it), bytes, packets, retries, and `rx_rate`/`tx_rate` (bitrate in kbit/s, mcs, nss, chwidth, sgi).
+  - Each interface's `clients` (mac, addresses, ports) combine its SSIDs' stations, its IPv4 neighbours (`/proc/net/arp` on its L3 device), IPv6 from `luci-rpc getHostHints`, and the MACs the bridge learned on wired ports.
+    - `getHostHints` keys its answer by upper-case MAC (every key on bifrost); the agent lowers them, as it does every MAC.
+    - The bridge's MACs come from `/sys/class/net/<bridge>/brforward`: 16-byte `__fdb_entry` records, with port numbers mapped through `brif/*/port_no`. It has no VLANs, so MACs without an IP go to `lan`, or else to the first interface on the bridge.
+  - Left out:
+    - the device's own MACs;
+    - everything learned on the uplink, the port the default gateway's MAC is learned on (on bifrost, lan4 carries about 43 MACs);
+    - on a device with an uplink, neighbours that no port or SSID places. These are hosts the AP talks to elsewhere, such as the router, an SSH client or monitoring.
+    - where the default route isn't on a bridge (a router's WAN), everything on its L3 device, for every interface on it (`wan`, `wan6`): the ISP's gateway, a modem. The interfaces that carry a default route are those with one in netifd's `route` (target `0.0.0.0` or `::`, mask 0). On a bridge (an AP's `lan`), the uplink port says what's upstream instead.
+  - `ipv4.leases` (address, mac, hostname) are included where the device serves DHCP, placed by subnet. They come from `luci-rpc getDHCPLeases`, or else from `/tmp/dhcp.leases`.
+  - `capabilities.macaddr` (`lan`, `wan`) lets the controller tell managed devices from clients.
+- **The controller's client list** (`steward-controller/src/clients.rs`, `/api/clients`, `steward-controller clients`) has one entry per MAC.
+  - Only connected devices' states count: an offline AP's stored state says who was on it, not who is. Every adopted device's own MACs and BSSIDs are still left out.
+  - Wireless wins. While roaming, the association that was active last: its state's arrival less its `inactive`, because states arrive at different times.
+  - A wired client goes where it was seen on the port with the fewest clients, i.e. the AP's port rather than the router's port towards the AP.
+  - Names come from leases, which only the router has. A network of APs without an agent on the router has clients with no names and few IPs.
+- LLDP peers aren't reported yet.
 
 ## Capabilities
 

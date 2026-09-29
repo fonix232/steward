@@ -6,18 +6,14 @@ The project's tasks, one Markdown card each, kept with [kanban](https://github.c
 | --- | --- |
 | [Backlog](backlog/_backlog.md) | 35 |
 | [Next](next/_next.md) | 4 |
-| [Ready to start](todo/_todo.md) | 1 |
+| [Ready to start](todo/_todo.md) | 0 |
 | [In progress](doing/_doing.md) | 0 |
 | [In review](review/_review.md) | 1 |
-| [Done](done/_done.md) | 16 |
+| [Done](done/_done.md) | 17 |
 
 ## In review
 
 - [STW-7](review/007-packages-and-per-architecture-feed.md): Packages and per-architecture feed
-
-## Ready to start
-
-- [STW-19](todo/019-clients.md): Clients
 
 ## Next
 
