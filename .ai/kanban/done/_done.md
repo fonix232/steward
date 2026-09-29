@@ -6,3 +6,4 @@
 4. [STW-3: ubus client in Rust](003-ubus-client-in-rust.md)
 5. [STW-4: Apply with automatic rollback](004-apply-with-automatic-rollback.md)
 6. [STW-5: Agent–controller connection](005-agent-controller-connection.md)
+7. [STW-6: Find the controller automatically](006-find-the-controller-automatically.md)

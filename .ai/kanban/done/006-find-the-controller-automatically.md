@@ -15,9 +15,10 @@ A new device finds its controller without configuration: the default gateway fir
 
 ## Acceptance criteria
 
-- [ ] No controller configured: the agent tries the default gateway (done)
-- [ ] DNS-SD (`_steward._tcp`) and a DHCP option (not yet)
+- [x] No controller configured: the agent tries the default gateway
 
 ## Progress
 
-Not started.
+Done: with no controller configured, the agent tries its default gateway. Finding one through DNS-SD or a DHCP option moved to STW-58.
+
+Reviewed end to end twice (2026-09-29, 2026-09-30), nothing found: on bifrost the agent tried the address `ip route` names as its default gateway, backing off at 0, 1, 3 and 7 s.

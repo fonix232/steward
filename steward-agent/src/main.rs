@@ -42,22 +42,28 @@ async fn main() {
             }
             "--controller" => controller = it.next(),
             _ => {
-                eprintln!("usage: steward-agent --controller <ws://host:port>");
+                eprintln!("usage: steward-agent [--controller <ws://host:port>]");
                 std::process::exit(2);
             }
         }
     }
-    let Some(url) = controller else {
-        eprintln!(
-            "steward-agent: no controller given (--controller ws://host:{})",
-            proto::PORT
-        );
-        std::process::exit(2);
-    };
 
-    // Reconnect for ever, backing off to a minute.
+    // Reconnect for ever, backing off to a minute. Without a controller
+    // given, it is on the default gateway (the router, which usually hosts
+    // it), looked up again for every attempt.
     let mut backoff = Backoff::default();
     loop {
+        let url = match &controller {
+            Some(url) => url.clone(),
+            None => match device::default_gateway() {
+                Some(gw) => format!("ws://{gw}:{}", proto::PORT),
+                None => {
+                    log!("no controller given and no default gateway to look for one on");
+                    sleep(backoff.after(None)).await;
+                    continue;
+                }
+            },
+        };
         let mut connected = None;
         match session(&url, &mut connected).await {
             Ok(()) => log!("controller closed the connection"),

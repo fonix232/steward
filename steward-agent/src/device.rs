@@ -2,6 +2,7 @@
 //! `/etc/board.json`.
 
 use serde_json::{Map, Value, json};
+use std::net::Ipv4Addr;
 use steward_proto as proto;
 use steward_ubus::Ubus;
 
@@ -96,4 +97,45 @@ pub fn state() -> Result<Value, steward_ubus::Error> {
             "memory": info.get("memory"),
         }
     }))
+}
+
+/// The IPv4 default gateway, from /proc/net/route.
+pub fn default_gateway() -> Option<Ipv4Addr> {
+    gateway_in(&std::fs::read_to_string("/proc/net/route").ok()?)
+}
+
+/// The gateway of the first default route in a /proc/net/route table, whose
+/// addresses are hex in the kernel's (little-endian) byte order.
+fn gateway_in(table: &str) -> Option<Ipv4Addr> {
+    table.lines().skip(1).find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let (dest, gw, mask) = (f.get(1)?, f.get(2)?, f.get(7)?);
+        if *dest != "00000000" || *mask != "00000000" {
+            return None;
+        }
+        let gw = u32::from_str_radix(gw, 16).ok()?;
+        (gw != 0).then(|| Ipv4Addr::from(gw.to_le_bytes()))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_route_names_the_gateway() {
+        // 192.0.2.1 via br-lan.1; a link route and a VLAN route besides.
+        let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+            br-lan.1\t000200C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n\
+            br-lan.1\t00000000\t010200C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+            br-lan.10\t006433C6\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+        assert_eq!(gateway_in(table), Some(Ipv4Addr::new(192, 0, 2, 1)));
+    }
+
+    #[test]
+    fn no_default_route_no_gateway() {
+        let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\n\
+            br-lan.1\t000200C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\n";
+        assert_eq!(gateway_in(table), None);
+    }
 }
