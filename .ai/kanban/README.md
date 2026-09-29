@@ -1,0 +1,38 @@
+# Steward: the board
+
+The project's tasks, one Markdown card each, kept with [kanban](https://github.com/fonix232/skills/tree/main/kanban): a folder per column, cards named `<number>-<title>.md`, and each column's order in its `_<column>.md`. Tickets are `STW-<number>`, and commit subjects start with theirs.
+
+| Column | Cards |
+| --- | --- |
+| [Backlog](backlog/_backlog.md) | 35 |
+| [Next](next/_next.md) | 4 |
+| [Ready to start](todo/_todo.md) | 16 |
+| [In progress](doing/_doing.md) | 0 |
+| [In review](review/_review.md) | 0 |
+| [Done](done/_done.md) | 2 |
+
+## Ready to start
+
+- [STW-2](todo/002-ucentral-message-types.md): uCentral message types
+- [STW-3](todo/003-ubus-client-in-rust.md): ubus client in Rust
+- [STW-4](todo/004-apply-with-automatic-rollback.md): Apply with automatic rollback
+- [STW-5](todo/005-agent-controller-connection.md): Agent–controller connection
+- [STW-6](todo/006-find-the-controller-automatically.md): Find the controller automatically
+- [STW-7](todo/007-packages-and-per-architecture-feed.md): Packages and per-architecture feed
+- [STW-9](todo/009-encrypted-device-channel-wss.md): Encrypted device channel (wss://)
+- [STW-10](todo/010-adopt-devices.md): Adopt devices
+- [STW-20](todo/020-controller-on-the-router.md): Controller on the router
+- [STW-12](todo/012-wifi-networks-and-radios.md): WiFi networks and radios
+- [STW-15](todo/015-controller-api.md): Controller API
+- [STW-11](todo/011-apply-configurations.md): Apply configurations
+- [STW-13](todo/013-networks-and-vlans.md): Networks and VLANs
+- [STW-14](todo/014-controller-storage.md): Controller storage
+- [STW-18](todo/018-device-state-and-health.md): Device state and health
+- [STW-19](todo/019-clients.md): Clients
+
+## Next
+
+- [STW-22](next/022-802-1x-radius-wifi.md): 802.1X / RADIUS WiFi
+- [STW-23](next/023-band-steering-and-fast-roaming.md): Band steering and fast roaming
+- [STW-28](next/028-poe-control.md): PoE control
+- [STW-32](next/032-dhcp-and-dns.md): DHCP and DNS

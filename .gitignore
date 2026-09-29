@@ -1,0 +1,12 @@
+# macOS Finder metadata. Written into any directory the Finder has merely
+# looked at, so it turns up anywhere.
+.DS_Store
+
+# AI tooling: per-user runtime state only. .claude/agents|commands|skills are symlinks into
+# .ai/ and stay tracked.
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/worktrees/
+
+# Local reviews, investigation evidence and scratch notes.
+/.ai/local/

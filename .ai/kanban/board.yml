@@ -1,0 +1,79 @@
+# Steward's board. The kanban skill (github.com/fonix232/skills, kanban/) documents every key.
+name: Steward
+key: STW
+
+columns:
+  - id: backlog
+    title: Backlog
+  - id: next
+    title: Next
+  - id: todo
+    title: Ready to start
+  - id: doing
+    title: In progress
+  - id: review
+    title: In review
+  - id: done
+    title: Done
+
+fields:
+  - name: type
+    label: Type
+    kind: select
+    options: [feature, bug, refactor, chore, docs, spike]
+  - name: priority
+    label: Priority
+    kind: select
+    marker: true
+    options:
+      - { value: P0, color: red }
+      - { value: P1, color: amber }
+      - { value: P2, color: blue }
+      - { value: P3, color: gray }
+  - name: category
+    label: Category
+    kind: select
+    tile: true
+    options: [foundation, adoption-security, wifi, switching, gateway, security, visibility, interface, operations]
+  - name: effort
+    label: Effort
+    kind: select
+    tile: true
+    options: [XS, S, M, L, XL]
+  - name: roles
+    label: Runs on
+    kind: multiselect
+    options: [router, ap, switch]
+  - name: components
+    label: Components
+    kind: list
+    help: Packages and crates the card touches.
+  - name: packages
+    label: OpenWrt packages
+    kind: list
+    help: What the card builds on from OpenWrt's feeds.
+  - name: needs_packaging
+    label: Needs packaging
+    kind: list
+    help: Software the OpenWrt feeds lack, for Steward's feed.
+  - name: unifi
+    label: UniFi equivalent
+    kind: text
+  - name: depends_on
+    label: Depends on
+    kind: cards
+
+template: |
+  What the card is for, in a sentence or two.
+
+  ## Acceptance criteria
+
+  - [ ] Written when the card is scheduled into Ready to start.
+
+  ## Tasks
+
+  - [ ] Written when the card is started.
+
+  ## Progress
+
+  Not started.
