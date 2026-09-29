@@ -2,7 +2,7 @@
 
 A free and open-source network controller for OpenWrt, aiming at the experience UniFi gives: install it on the router, and the access points, switches and other OpenWrt devices on the network are adopted and managed from one web interface. Topology, per-device and per-client traffic, and IDS/IPS are part of the plan.
 
-**Status: early.** The agent connects to the controller over plain WebSocket (`ws://`), and reports what the device is and its state (load, memory, uptime). With no controller given, it looks for one on its default gateway. The controller sends a device its stored configuration (`/etc/steward/configs/<serial>.json`), and the agent refuses it: applying configurations isn't implemented yet. TLS, adoption, the configuration renderer and the web interface come next.
+**Status: early.** The agent connects to the controller over TLS (`wss://`), pinning the controller's certificate authority the first time it connects, and reports what the device is and its state (load, memory, uptime). With no controller given, it looks for one on its default gateway. The controller sends a device its stored configuration (`/etc/steward/configs/<serial>.json`), and the agent refuses it: applying configurations isn't implemented yet. Adoption, the configuration renderer and the web interface come next.
 
 ## How it fits together (the design)
 
@@ -11,7 +11,7 @@ A free and open-source network controller for OpenWrt, aiming at the experience 
 - **steward-web** will be the controller's web interface, served by the controller.
 - **steward** installs all three, for the device that hosts the controller.
 
-Agent and controller speak uCentral's protocol (the Telecom Infra Project's OpenLAN): JSON-RPC 2.0 over a WebSocket the device opens to the controller on port 15002. Both are written in Rust; `crates/proto` holds the messages they share, and `crates/ubus` is the agent's way onto the device's ubus (rpcd's `uci` object included).
+Agent and controller speak uCentral's protocol (the Telecom Infra Project's OpenLAN): JSON-RPC 2.0 over a WebSocket the device opens to the controller on port 15002, over TLS: the controller is its own certificate authority, and each agent pins it the first time it connects. Both are written in Rust; `crates/proto` holds the messages they share, and `crates/ubus` is the agent's way onto the device's ubus (rpcd's `uci` object included).
 
 ## Install (OpenWrt 25.12 and later)
 
@@ -35,6 +35,7 @@ The feed has one repository per package architecture:
 
     Cargo.toml            the cargo workspace; its version is every package's
     crates/proto/         uCentral's messages, shared by agent and controller
+    crates/tls/           the device channel's TLS: the controller's CA, the agent's pin
     crates/ubus/          a ubus client in Rust (no libubus), for the agent
     steward-agent/        package: Makefile, Rust crate, files/ (init, UCI config)
     steward-controller/   package: Makefile, Rust crate, files/

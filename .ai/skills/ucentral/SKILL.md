@@ -46,4 +46,8 @@ So Steward renders the schema itself, into UCI sections the agent owns and marks
 
 ## TLS and trust
 
-TIP's devices trust the gateway CA they were provisioned with (`/etc/ucentral/operational.ca`, TIP's PKI), or any self-signed certificate when `allow-self-signed` is set. Steward uses plain `ws://` today. TLS with Steward's own CA and an adoption step is next (`.ai/plans/roadmap.md`).
+TIP's devices trust the gateway CA they were provisioned with (`/etc/ucentral/operational.ca`, TIP's PKI), or any self-signed certificate when `allow-self-signed` is set. Steward's controller is its own CA instead (`crates/tls`):
+- **Controller:** on first start it creates the CA and a server certificate in `<state dir>/tls/` (`ca.pem`, `ca.key`, `server.pem`, `server.key`; the keys 0600) and serves both on every handshake.
+- **Agent:** it trusts the first controller it reaches and pins its CA in `<state dir>/controller-ca.pem`. From then on, only a server certificate that chains to that CA is accepted. The host name isn't checked, since the pin identifies the controller. Only a missing pin file means first use: one that can't be read or holds no certificate stops the agent, with an error naming the file, rather than trusting the next controller.
+- **Moving a device** to another controller means removing its pin; adoption (STW-10) will manage this.
+- **Validity** runs 2020–2099, because devices without an RTC boot with their image's build date.

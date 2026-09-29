@@ -1,0 +1,19 @@
+[package]
+name = "steward-tls"
+description = "The device channel's TLS: the controller's certificate authority, and the agent's pin on it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+rcgen.workspace = true
+ring.workspace = true
+rustls.workspace = true
+rustls-webpki.workspace = true
+tokio-rustls.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

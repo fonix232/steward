@@ -7,3 +7,4 @@
 5. [STW-4: Apply with automatic rollback](004-apply-with-automatic-rollback.md)
 6. [STW-5: Agent–controller connection](005-agent-controller-connection.md)
 7. [STW-6: Find the controller automatically](006-find-the-controller-automatically.md)
+8. [STW-9: Encrypted device channel (wss://)](009-encrypted-device-channel-wss.md)

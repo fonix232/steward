@@ -6,10 +6,10 @@ The project's tasks, one Markdown card each, kept with [kanban](https://github.c
 | --- | --- |
 | [Backlog](backlog/_backlog.md) | 35 |
 | [Next](next/_next.md) | 4 |
-| [Ready to start](todo/_todo.md) | 10 |
+| [Ready to start](todo/_todo.md) | 9 |
 | [In progress](doing/_doing.md) | 0 |
 | [In review](review/_review.md) | 1 |
-| [Done](done/_done.md) | 7 |
+| [Done](done/_done.md) | 8 |
 
 ## In review
 
@@ -17,7 +17,6 @@ The project's tasks, one Markdown card each, kept with [kanban](https://github.c
 
 ## Ready to start
 
-- [STW-9](todo/009-encrypted-device-channel-wss.md): Encrypted device channel (wss://)
 - [STW-10](todo/010-adopt-devices.md): Adopt devices
 - [STW-20](todo/020-controller-on-the-router.md): Controller on the router
 - [STW-12](todo/012-wifi-networks-and-radios.md): WiFi networks and radios

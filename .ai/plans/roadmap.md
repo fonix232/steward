@@ -12,9 +12,9 @@
 ## Next, in order
 
 1. **TLS and adoption.**
-   - The controller creates its own CA on first start and serves `wss://`.
+   - Done: the controller creates its own CA on first start and serves `wss://`; agents pin it on first use.
    - A new device shows as pending, and the user adopts it.
-   - The controller then hands the device a credential and its certificate's fingerprint to pin, and later connections use them.
+   - The controller then hands the device a credential, and later connections present it.
 2. **The configuration renderer.**
    - Render a subset of uCentral's schema into sections the agent owns and marks: radios, SSIDs, VLANs, ports.
    - Apply it through `uci::Transaction`, and confirm once the controller answers again.

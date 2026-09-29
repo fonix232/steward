@@ -45,6 +45,8 @@ define Package/steward-controller/install
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/bin/steward-controller $(1)/usr/sbin/
 	$(INSTALL_BIN) ./files/steward-controller.init $(1)/etc/init.d/steward-controller
 	$(INSTALL_CONF) ./files/steward-controller.config $(1)/etc/config/steward-controller
+	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
+	$(INSTALL_DATA) ./files/steward-controller.keep $(1)/lib/upgrade/keep.d/steward-controller
 endef
 
 $(eval $(call RustBinPackage,steward-controller))

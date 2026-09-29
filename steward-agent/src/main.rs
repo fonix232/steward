@@ -1,16 +1,26 @@
 //! steward-agent: connects this device to a Steward controller and applies
 //! the configuration it sends (UCI and ubus on the device's side, uCentral's
 //! protocol on the controller's).
+//!
+//! The channel is TLS (`wss://`). The first controller the agent reaches is
+//! trusted on first use: its certificate authority is pinned in
+//! `<state dir>/controller-ca.pem`, and from then on only a controller whose
+//! certificate chains to that CA is accepted. Plain `ws://` needs
+//! `--allow-plaintext` (development only).
 
 mod device;
 
 use futures_util::{SinkExt, StreamExt};
+use std::path::PathBuf;
 use std::time::Duration;
 use steward_proto::{self as proto, Message, command, event};
+use steward_tls::{PinFile, PinnedCa, ServerName, TlsConnector, fingerprint};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 use tokio::time::{Instant, interval, sleep, timeout, timeout_at};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as Frame;
+use tokio_tungstenite::tungstenite::http::Uri;
 
 macro_rules! log {
     ($($t:tt)*) => { eprintln!("steward-agent: {}", format_args!($($t)*)) };
@@ -33,6 +43,8 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut controller = None;
+    let mut state_dir = PathBuf::from("/etc/steward-agent");
+    let mut allow_plaintext = false;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -41,12 +53,40 @@ async fn main() {
                 return;
             }
             "--controller" => controller = it.next(),
+            "--state-dir" => state_dir = it.next().expect("--state-dir <dir>").into(),
+            "--allow-plaintext" => allow_plaintext = true,
             _ => {
-                eprintln!("usage: steward-agent [--controller <ws://host:port>]");
+                eprintln!(
+                    "usage: steward-agent [--controller <wss://host:port>] [--state-dir <dir>] [--allow-plaintext]"
+                );
                 std::process::exit(2);
             }
         }
     }
+    if let Some(url) = &controller {
+        match url
+            .parse::<Uri>()
+            .ok()
+            .and_then(|u| u.scheme_str().map(str::to_owned))
+            .as_deref()
+        {
+            Some("wss") => {}
+            Some("ws") if allow_plaintext => {
+                log!("plain ws:// to {url} (--allow-plaintext): development only")
+            }
+            Some("ws") => {
+                eprintln!(
+                    "steward-agent: {url} is plain ws://; the channel is wss://, or pass --allow-plaintext"
+                );
+                std::process::exit(2);
+            }
+            _ => {
+                eprintln!("steward-agent: {url} is not a wss:// URL");
+                std::process::exit(2);
+            }
+        }
+    }
+    let pin = PinFile(state_dir.join("controller-ca.pem"));
 
     // Reconnect for ever, backing off to a minute. Without a controller
     // given, it is on the default gateway (the router, which usually hosts
@@ -56,7 +96,7 @@ async fn main() {
         let url = match &controller {
             Some(url) => url.clone(),
             None => match device::default_gateway() {
-                Some(gw) => format!("ws://{gw}:{}", proto::PORT),
+                Some(gw) => format!("wss://{gw}:{}", proto::PORT),
                 None => {
                     log!("no controller given and no default gateway to look for one on");
                     sleep(backoff.after(None)).await;
@@ -65,7 +105,7 @@ async fn main() {
             },
         };
         let mut connected = None;
-        match session(&url, &mut connected).await {
+        match session(&url, &pin, &mut connected).await {
             Ok(()) => log!("controller closed the connection"),
             Err(e) => log!("{url}: {e}"),
         }
@@ -102,11 +142,62 @@ impl Default for Backoff {
     }
 }
 
-/// One session, from the WebSocket to its end. `connected` is set once `connect` has gone out.
-async fn session(url: &str, connected: &mut Option<Instant>) -> Result<(), Error> {
-    let (ws, _) = timeout(OPEN_TIMEOUT, tokio_tungstenite::connect_async(url))
+/// Connects to the controller: TLS checked against the pinned CA (or trusted on first use and
+/// pinned), then the WebSocket, all within [`OPEN_TIMEOUT`]. `connected` is set once `connect`
+/// has gone out.
+async fn session(url: &str, pin: &PinFile, connected: &mut Option<Instant>) -> Result<(), Error> {
+    let uri: Uri = url.parse()?;
+    let host = uri.host().ok_or("no host in the controller URL")?;
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let port = uri.port_u16().unwrap_or(proto::PORT);
+    let late = || format!("no answer in {} s", OPEN_TIMEOUT.as_secs());
+    if uri.scheme_str() == Some("ws") {
+        let (ws, _) = timeout(OPEN_TIMEOUT, async {
+            let tcp = TcpStream::connect((host.as_str(), port)).await?;
+            Ok::<_, Error>(tokio_tungstenite::client_async(url, tcp).await?)
+        })
         .await
-        .map_err(|_| format!("no answer in {} s", OPEN_TIMEOUT.as_secs()))??;
+        .map_err(|_| late())??;
+        return start(ws, url, connected).await;
+    }
+    let pinned = pin.load()?;
+    let verifier = PinnedCa::new(pinned.clone());
+    let connector = TlsConnector::from(verifier.client_config()?);
+    let name = ServerName::try_from(host.clone())?;
+    let (ws, _) = timeout(OPEN_TIMEOUT, async {
+        let tcp = TcpStream::connect((host.as_str(), port)).await?;
+        let tls = connector.connect(name, tcp).await?;
+        Ok::<_, Error>(tokio_tungstenite::client_async(url, tls).await?)
+    })
+    .await
+    .map_err(|_| late())??;
+    match verifier.first_use() {
+        Some(ca) => {
+            pin.save(&ca)?;
+            log!(
+                "pinned the controller's CA {} ({})",
+                fingerprint(&ca),
+                pin.0.display()
+            );
+        }
+        None => {
+            if let Some(ca) = &pinned {
+                log!("controller's CA matches the pin {}", fingerprint(ca));
+            }
+        }
+    }
+    start(ws, url, connected).await
+}
+
+/// A session on an open WebSocket: the device's identity, then [`talk`].
+async fn start<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: WebSocketStream<S>,
+    url: &str,
+    connected: &mut Option<Instant>,
+) -> Result<(), Error> {
     let info = tokio::task::spawn_blocking(device::identity).await??;
     log!("connected to {url} as {}", info.serial);
     talk(ws, info, device::state, connected).await
@@ -268,16 +359,29 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_controller_that_takes_the_connection_and_never_answers_is_given_up_on() {
-        // The listen backlog takes the connection; nothing ever answers the upgrade.
+        // The listen backlog takes the connection; nothing ever answers the upgrade, nor, over
+        // TLS, the handshake (no pin here: it would be the first use).
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
-        let start = Instant::now();
-        let mut connected = None;
-        let ended = timeout(Duration::from_secs(3600), session(&url, &mut connected)).await;
-        let err = ended.expect("still waiting after an hour").unwrap_err();
-        assert!(err.to_string().contains("no answer in 30 s"), "{err}");
-        about(start.elapsed(), OPEN_TIMEOUT);
-        assert!(connected.is_none());
+        let addr = listener.local_addr().unwrap();
+        let pin = PinFile(PathBuf::from(
+            "/nonexistent/steward-agent/controller-ca.pem",
+        ));
+        for url in [format!("ws://{addr}"), format!("wss://{addr}")] {
+            let start = Instant::now();
+            let mut connected = None;
+            let ended = timeout(
+                Duration::from_secs(3600),
+                session(&url, &pin, &mut connected),
+            )
+            .await;
+            let err = ended.expect("still waiting after an hour").unwrap_err();
+            assert!(
+                err.to_string().contains("no answer in 30 s"),
+                "{url}: {err}"
+            );
+            about(start.elapsed(), OPEN_TIMEOUT);
+            assert!(connected.is_none());
+        }
     }
 
     #[tokio::test(start_paused = true)]

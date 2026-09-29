@@ -29,12 +29,12 @@ The output is in `target-musl/release/` (ignored by git).
 Run both ends on the device, the controller on loopback, so nothing is exposed:
 
     cd /tmp/stw
-    ./steward-controller --listen 127.0.0.1:15002 --config-dir /tmp/stw/configs > ctl.log 2>&1 &
-    ./steward-agent --controller ws://127.0.0.1:15002 > agent.log 2>&1 &
+    ./steward-controller --listen 127.0.0.1:15002 --state-dir /tmp/stw/controller > ctl.log 2>&1 &
+    ./steward-agent --controller wss://127.0.0.1:15002 --state-dir /tmp/stw/agent > agent.log 2>&1 &
 
-Expect `connected`, then `state` with load, memory and uptime. To exercise `configure`, take the serial from `ctl.log`, write `{"uuid": 5, "interfaces": []}` to `configs/<serial>.json`, and restart the agent. The controller sends the config, and the agent answers with its honest status. Kill both and remove `/tmp/stw`.
+Expect the controller to log its CA's fingerprint. The agent should log `pinned the controller's CA` on the first run and `matches the pin` afterwards, then `connected`, then `state` with load, memory and uptime. To check that the pin holds, start a controller with a fresh `--state-dir`: the agent must refuse it ("not the controller this device was pinned to"). An emptied pin file must stop it too ("holds no certificate"), not pin again. To exercise `configure`, take the serial from `ctl.log`, write `{"uuid": 5, "interfaces": []}` to `controller/configs/<serial>.json`, and restart the agent. The controller sends the config, and the agent answers with its honest status. Kill both and remove `/tmp/stw`.
 
-Without `--controller`, the agent tries `ws://<default gateway>:15002`. With nothing listening there, expect `Connection refused` retries.
+Without `--controller`, the agent tries `wss://<default gateway>:15002`. With nothing listening there, expect `Connection refused` retries.
 
 ## ubus and rpcd checks
 

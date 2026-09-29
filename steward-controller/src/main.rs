@@ -2,9 +2,12 @@
 //! and serves the web interface (steward-web).
 //!
 //! Devices connect over a WebSocket on port 15002 and speak uCentral's
-//! protocol (`steward_proto`). A device's configuration lives in
-//! `<config dir>/<serial>.json`, a uCentral configuration whose `uuid`
-//! numbers it; a device reporting another uuid is sent it.
+//! protocol (`steward_proto`). The channel is TLS (`wss://`): on first start
+//! the controller creates its own certificate authority and a server
+//! certificate in `<state dir>/tls/`, and agents pin that CA (`steward_tls`).
+//! A device's configuration lives in `<config dir>/<serial>.json`, a uCentral
+//! configuration whose `uuid` numbers it; a device reporting another uuid is
+//! sent it.
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -14,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use steward_proto::{self as proto, Message, Outcome, command, event};
+use steward_tls::{ControllerIdentity, TlsAcceptor, fingerprint};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
@@ -25,7 +29,9 @@ macro_rules! log {
     ($($t:tt)*) => { eprintln!("steward-controller: {}", format_args!($($t)*)) };
 }
 
-/// How long a new connection has for its WebSocket upgrade, and then for its `connect`.
+/// How long a new connection has for its TLS handshake, then for its WebSocket upgrade, and
+/// then for its `connect`.
+const TLS_TIMEOUT: Duration = Duration::from_secs(10);
 const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Connections that haven't sent `connect` yet, at most. Further ones wait in the listen
@@ -45,14 +51,19 @@ const LOG_TEXT: usize = 128;
 
 struct Args {
     listen: String,
-    config_dir: PathBuf,
+    state_dir: PathBuf,
+    config_dir: Option<PathBuf>,
+    /// Serve plain ws:// (development only).
+    plaintext: bool,
 }
 
 impl Args {
     fn parse() -> Args {
         let mut a = Args {
             listen: format!("[::]:{}", proto::PORT),
-            config_dir: PathBuf::from("/etc/steward/configs"),
+            state_dir: PathBuf::from("/etc/steward"),
+            config_dir: None,
+            plaintext: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -62,10 +73,15 @@ impl Args {
                     std::process::exit(0);
                 }
                 "--listen" => a.listen = it.next().expect("--listen <address:port>"),
-                "--config-dir" => a.config_dir = it.next().expect("--config-dir <dir>").into(),
+                "--state-dir" => a.state_dir = it.next().expect("--state-dir <dir>").into(),
+                "--config-dir" => {
+                    a.config_dir = Some(it.next().expect("--config-dir <dir>").into())
+                }
+                "--plaintext" => a.plaintext = true,
                 _ => {
                     eprintln!(
-                        "usage: steward-controller [--listen <address:port>] [--config-dir <dir>]"
+                        "usage: steward-controller [--listen <address:port>] [--state-dir <dir>] \
+                         [--config-dir <dir>] [--plaintext]"
                     );
                     std::process::exit(2);
                 }
@@ -102,9 +118,25 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    log!("listening for devices on {}", args.listen);
+    let acceptor = if args.plaintext {
+        log!("serving plain ws:// (--plaintext): development only");
+        None
+    } else {
+        match tls(&args.state_dir.join("tls")) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                log!("{e}");
+                std::process::exit(1);
+            }
+        }
+    };
+    let scheme = if acceptor.is_some() { "wss" } else { "ws" };
+    log!("listening for devices on {scheme}://{}", args.listen);
     let registry = Shared::default();
-    let config_dir = Arc::new(args.config_dir);
+    let config_dir = Arc::new(
+        args.config_dir
+            .unwrap_or_else(|| args.state_dir.join("configs")),
+    );
     let handshakes = Arc::new(Semaphore::new(HANDSHAKES));
     loop {
         // A slot for the next connection, until it sends `connect`.
@@ -115,9 +147,12 @@ async fn main() {
             .expect("never closed");
         match listener.accept().await {
             Ok((tcp, addr)) => {
-                let (registry, config_dir) = (registry.clone(), config_dir.clone());
+                let (registry, config_dir, acceptor) =
+                    (registry.clone(), config_dir.clone(), acceptor.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = serve(tcp, addr, registry, config_dir, handshake).await {
+                    let result =
+                        connection(tcp, addr, acceptor, registry, config_dir, handshake).await;
+                    if let Err(e) = result {
                         // It can quote the device (serde's errors do).
                         log!("{addr}: {}", clip(&e.to_string()));
                     }
@@ -132,6 +167,38 @@ async fn main() {
 }
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// The device channel's TLS: the controller's identity, created on first start.
+fn tls(dir: &Path) -> Result<TlsAcceptor, Error> {
+    let id = ControllerIdentity::load_or_create(dir)?;
+    log!(
+        "{} the controller's CA in {}: {}",
+        if id.created { "created" } else { "loaded" },
+        dir.display(),
+        fingerprint(&id.ca)
+    );
+    Ok(TlsAcceptor::from(id.server_config()?))
+}
+
+/// A new connection on the device port: the TLS handshake (none with `--plaintext`), within
+/// [`TLS_TIMEOUT`], and then [`serve`].
+async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    addr: SocketAddr,
+    acceptor: Option<TlsAcceptor>,
+    registry: Shared,
+    config_dir: Arc<PathBuf>,
+    handshake: OwnedSemaphorePermit,
+) -> Result<(), Error> {
+    let Some(acceptor) = acceptor else {
+        return serve(stream, addr, registry, config_dir, handshake).await;
+    };
+    match timeout(TLS_TIMEOUT, acceptor.accept(stream)).await {
+        Ok(Ok(tls)) => serve(tls, addr, registry, config_dir, handshake).await,
+        Ok(Err(e)) => Err(format!("TLS handshake: {e}").into()),
+        Err(_) => Err("no TLS handshake in time".into()),
+    }
+}
 
 /// One device connection, from its `connect` to its end. Until `connect` arrives it holds
 /// `handshake`, its slot among the connections that haven't sent one, and it has
@@ -349,45 +416,73 @@ async fn provision(serial: &str, registry: &Shared, config_dir: &Path) {
 mod tests {
     use super::*;
     use serde_json::json;
+    use steward_tls::{PinnedCa, ServerName, TlsConnector};
     use tokio::io::DuplexStream;
     use tokio::task::JoinHandle;
     use tokio::time::Instant;
     use tokio_tungstenite::WebSocketStream;
 
-    /// A connection to `serve` from a device, holding one of `slots`: the device's end.
+    /// A connection from a device, over TLS with `acceptor` or plain, holding one of `slots`:
+    /// the device's end.
     fn open(
         registry: &Shared,
         slots: &Arc<Semaphore>,
+        acceptor: Option<TlsAcceptor>,
     ) -> (DuplexStream, JoinHandle<Result<(), String>>) {
         let (device, controller) = tokio::io::duplex(1 << 16);
         let handshake = slots.clone().try_acquire_owned().unwrap();
         let (registry, config_dir) = (registry.clone(), Arc::new(PathBuf::from("/nonexistent")));
         let task = tokio::spawn(async move {
-            serve(
-                controller,
-                "192.0.2.10:40000".parse().unwrap(),
-                registry,
-                config_dir,
-                handshake,
-            )
-            .await
-            .map_err(|e| e.to_string())
+            let addr = "192.0.2.10:40000".parse().unwrap();
+            connection(controller, addr, acceptor, registry, config_dir, handshake)
+                .await
+                .map_err(|e| e.to_string())
         });
         (device, task)
     }
 
-    async fn upgrade(device: DuplexStream) -> WebSocketStream<DuplexStream> {
+    /// A controller's TLS, in a directory of its own.
+    fn acceptor(name: &str) -> (PathBuf, TlsAcceptor) {
+        let dir = std::env::temp_dir().join(format!("steward-conn-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let id = ControllerIdentity::load_or_create(&dir).unwrap();
+        (dir, TlsAcceptor::from(id.server_config().unwrap()))
+    }
+
+    /// The device's side of the TLS handshake (trusting the controller on first use).
+    async fn tls(device: DuplexStream) -> impl AsyncRead + AsyncWrite + Unpin {
+        let connector = TlsConnector::from(PinnedCa::new(None).client_config().unwrap());
+        let name = ServerName::try_from("192.0.2.1").unwrap();
+        connector.connect(name, device).await.unwrap()
+    }
+
+    async fn upgrade<S: AsyncRead + AsyncWrite + Unpin>(device: S) -> WebSocketStream<S> {
         tokio_tungstenite::client_async("ws://controller/", device)
             .await
             .unwrap()
             .0
     }
 
-    async fn send(ws: &mut WebSocketStream<DuplexStream>, method: &str, params: Value) {
+    async fn send<S: AsyncRead + AsyncWrite + Unpin>(
+        ws: &mut WebSocketStream<S>,
+        method: &str,
+        params: Value,
+    ) {
         let m = Message::notification(method, params).unwrap();
         ws.send(Frame::text(serde_json::to_string(&m).unwrap()))
             .await
             .unwrap();
+    }
+
+    fn hello() -> Value {
+        let hello = proto::Connect {
+            serial: "00005e005301".into(),
+            uuid: 0,
+            firmware: "OpenWrt".into(),
+            wanip: vec![],
+            capabilities: json!({}),
+        };
+        serde_json::to_value(hello).unwrap()
     }
 
     /// Asserts that `task` ended with `error` after `limit` (the clock is paused: exactly).
@@ -405,7 +500,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_connection_that_never_upgrades_is_dropped_and_frees_its_slot() {
         let (registry, slots) = (Shared::default(), Arc::new(Semaphore::new(1)));
-        let (_device, task) = open(&registry, &slots);
+        let (_device, task) = open(&registry, &slots, None);
         assert_eq!(slots.available_permits(), 0);
         ends_after(task, UPGRADE_TIMEOUT, "no WebSocket upgrade in time").await;
         assert_eq!(slots.available_permits(), 1);
@@ -414,7 +509,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_connection_that_never_sends_connect_is_dropped_and_frees_its_slot() {
         let (registry, slots) = (Shared::default(), Arc::new(Semaphore::new(1)));
-        let (device, task) = open(&registry, &slots);
+        let (device, task) = open(&registry, &slots, None);
         let mut ws = upgrade(device).await;
         // Anything but `connect` doesn't count.
         send(
@@ -432,21 +527,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn connect_frees_the_slot_and_the_device_stays_connected() {
         let (registry, slots) = (Shared::default(), Arc::new(Semaphore::new(1)));
-        let (device, task) = open(&registry, &slots);
+        let (device, task) = open(&registry, &slots, None);
         let mut ws = upgrade(device).await;
-        let hello = proto::Connect {
-            serial: "00005e005301".into(),
-            uuid: 0,
-            firmware: "OpenWrt".into(),
-            wanip: vec![],
-            capabilities: json!({}),
-        };
-        send(
-            &mut ws,
-            event::CONNECT,
-            serde_json::to_value(hello).unwrap(),
-        )
-        .await;
+        send(&mut ws, event::CONNECT, hello()).await;
         sleep(Duration::from_millis(1)).await;
         assert_eq!(slots.available_permits(), 1);
         // Well past both time limits, it's still there.
@@ -467,7 +550,7 @@ mod tests {
     async fn a_message_over_the_limit_ends_the_connection_unread() {
         let (registry, slots) = (Shared::default(), Arc::new(Semaphore::new(1)));
         // Just under the limit: read, and the device is in.
-        let (device, task) = open(&registry, &slots);
+        let (device, task) = open(&registry, &slots, None);
         let mut ws = upgrade(device).await;
         let big = "f".repeat(MAX_MESSAGE - 1000);
         send(&mut ws, event::CONNECT, connect_as("00005e005301", big)).await;
@@ -478,7 +561,7 @@ mod tests {
 
         // Over it: the connection ends at the frame's header, while the device is still
         // sending, and nothing is registered.
-        let (device, task) = open(&registry, &slots);
+        let (device, task) = open(&registry, &slots, None);
         let mut ws = upgrade(device).await;
         let huge = connect_as("00005e005302", "f".repeat(2 * MAX_MESSAGE));
         let huge = Message::notification(event::CONNECT, huge).unwrap();
@@ -493,7 +576,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_serial_too_long_to_log_is_refused() {
         let (registry, slots) = (Shared::default(), Arc::new(Semaphore::new(1)));
-        let (device, task) = open(&registry, &slots);
+        let (device, task) = open(&registry, &slots, None);
         let mut ws = upgrade(device).await;
         let serial = "0".repeat(LOG_TEXT + 1);
         send(
@@ -510,7 +593,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_device_that_goes_silent_is_dropped() {
         let (registry, slots) = (Shared::default(), Arc::new(Semaphore::new(1)));
-        let (device, task) = open(&registry, &slots);
+        let (device, task) = open(&registry, &slots, None);
         let mut ws = upgrade(device).await;
         send(
             &mut ws,
@@ -539,5 +622,30 @@ mod tests {
         // Two bytes a character, one byte off: cut at a character boundary.
         let long = format!("v{}", "é".repeat(1000));
         assert_eq!(clip(&long), format!("v{}… (2001 bytes)", "é".repeat(63)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn over_tls_the_handshake_has_a_time_limit_too() {
+        let (dir, acceptor) = acceptor("tls");
+        let (registry, slots) = (Shared::default(), Arc::new(Semaphore::new(1)));
+        // Nothing at all: dropped after the TLS handshake's limit.
+        let (_device, task) = open(&registry, &slots, Some(acceptor.clone()));
+        ends_after(task, TLS_TIMEOUT, "no TLS handshake in time").await;
+        assert_eq!(slots.available_permits(), 1);
+        // A handshake, then nothing: dropped after the upgrade's.
+        let (device, task) = open(&registry, &slots, Some(acceptor.clone()));
+        let _device = tls(device).await;
+        ends_after(task, UPGRADE_TIMEOUT, "no WebSocket upgrade in time").await;
+        assert_eq!(slots.available_permits(), 1);
+        // All the way to `connect`: the device is in, and its slot is free.
+        let (device, task) = open(&registry, &slots, Some(acceptor));
+        let mut ws = upgrade(tls(device).await).await;
+        send(&mut ws, event::CONNECT, hello()).await;
+        sleep(Duration::from_millis(1)).await;
+        assert_eq!(slots.available_permits(), 1);
+        assert!(registry.lock().await.devices.contains_key("00005e005301"));
+        ws.close(None).await.unwrap();
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

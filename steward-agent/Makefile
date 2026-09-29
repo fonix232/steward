@@ -46,6 +46,8 @@ define Package/steward-agent/install
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/bin/steward-agent $(1)/usr/sbin/
 	$(INSTALL_BIN) ./files/steward-agent.init $(1)/etc/init.d/steward-agent
 	$(INSTALL_CONF) ./files/steward-agent.config $(1)/etc/config/steward-agent
+	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
+	$(INSTALL_DATA) ./files/steward-agent.keep $(1)/lib/upgrade/keep.d/steward-agent
 	$(INSTALL_DIR) $(1)/etc/apk/keys $(1)/etc/apk/repositories.d
 	$(INSTALL_DATA) $(STEWARD_ROOT)/feed/steward.pem $(1)/etc/apk/keys/steward.pem
 	echo "$(STEWARD_FEED)/$(ARCH_PACKAGES)/packages.adb" > $(1)/etc/apk/repositories.d/steward.list
