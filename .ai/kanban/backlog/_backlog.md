@@ -35,3 +35,5 @@
 33. [STW-55: Wired 802.1X](055-wired-802-1x.md)
 34. [STW-56: Multiple sites](056-multiple-sites.md)
 35. [STW-57: Public API](057-public-api.md)
+36. [STW-58: Find the controller: DNS-SD and a DHCP option](058-find-the-controller-dns-sd-and-dhcp.md)
+37. [STW-59: Restore radios' original values](059-restore-radio-originals.md)

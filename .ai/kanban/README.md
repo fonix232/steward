@@ -4,7 +4,7 @@ The project's tasks, one Markdown card each, kept with [kanban](https://github.c
 
 | Column | Cards |
 | --- | --- |
-| [Backlog](backlog/_backlog.md) | 35 |
+| [Backlog](backlog/_backlog.md) | 37 |
 | [Next](next/_next.md) | 4 |
 | [Ready to start](todo/_todo.md) | 0 |
 | [In progress](doing/_doing.md) | 0 |
