@@ -7,6 +7,7 @@ Steward is a free and open-source network controller for OpenWrt 25.12 and later
 ```
 Cargo.toml            the cargo workspace; its version is every package's
 crates/proto/         uCentral's messages (JSON-RPC 2.0) and a device's serial, shared by agent and controller
+crates/render/        uCentral configuration to UCI changes: pure, tested against the wifi scripts' schema
 crates/tls/           the device channel's TLS: the controller's CA and certificates, the agent's pin
 crates/ubus/          a ubus client in Rust (no libubus), and uci::Transaction (rpcd's rollback)
 steward-agent/        package: Makefile, crate (main.rs: connection loop; device.rs: what it reports), files/
@@ -23,7 +24,7 @@ feed/                 the feed's public key and its GitHub Pages page
 
 ## Design rules
 
-- The agent owns only the UCI sections it creates, and marks them. It never rewrites a whole config file or stops a service it didn't start: LuCI, rpcd and the user's own settings keep working on a managed device. TIP's renderer does the opposite (for its example config it would stop uhttpd and rpcd), which is why Steward doesn't use it.
+- The agent owns only the UCI sections it creates: named `stw_*` and marked `steward '1'` (`crates/render`). Radios are the one exception: they're the device's own `wifi-device` sections, so the renderer sets options on them and lists each one (`Plan::radio_options`) for applying to record the value it replaces. It never rewrites a whole config file or stops a service it didn't start: LuCI, rpcd and the user's own settings keep working on a managed device. TIP's renderer does the opposite (for its example config it would stop uhttpd and rpcd), which is why Steward doesn't use it.
 - Every configuration is applied with a rollback. `uci::Transaction` stages the changes in an rpcd session of its own, granted only the configs it names. It then runs `apply {rollback}` and, once the controller is reachable again, `confirm`. rpcd allows one pending rollback per device, so the agent's apply fails while a LuCI Save & Apply is pending: retry, don't force.
 - uCentral's protocol and configuration schema (TIP's `wlan-ucentral-schema`) are the wire format; TIP's renderer is a reference for the mapping, not a dependency. Answer `configure` honestly: 0 only when applied as sent, 1 with the substitutions listed, 2 when nothing was applied.
 - Neither end of the device channel can hold the other. The controller gives a new connection 10 s for its TLS handshake, 10 s for its WebSocket upgrade and then 10 s for `connect`, serves at most 32 connections that haven't sent `connect`, refuses messages and frames over 1 MiB (a state with 30 stations is about 23 KB), and drops a device that has sent nothing for 3 minutes (agents send their state every minute). What a device sends goes into the log cut to 128 bytes a value, and a longer serial is refused. The agent gives the controller 30 s to take a connection (TCP, TLS and the upgrade), and ends a session that has heard nothing from it for 3 minutes (it pings with every state), so its backoff takes over.

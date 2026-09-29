@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proto", "crates/tls", "crates/ubus", "steward-agent", "steward-controller"]
+members = ["crates/proto", "crates/render", "crates/tls", "crates/ubus", "steward-agent", "steward-controller"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,6 +15,7 @@ serde = { version = "1", features = ["derive"] }
 # meaningful).
 serde_json = { version = "1", features = ["preserve_order"] }
 steward-proto = { path = "crates/proto" }
+steward-render = { path = "crates/render" }
 steward-tls = { path = "crates/tls" }
 steward-ubus = { path = "crates/ubus" }
 # TLS on ring: aws-lc-rs (rustls' default) needs cmake and clang for every target, which the

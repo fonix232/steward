@@ -1,0 +1,16 @@
+[package]
+name = "steward-render"
+description = "uCentral configuration to the UCI changes that make a device run it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+steward-proto.workspace = true
+
+[dev-dependencies]
+steward-ubus.workspace = true

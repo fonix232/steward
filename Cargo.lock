@@ -630,6 +630,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "steward-render"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "steward-proto",
+ "steward-ubus",
+]
+
+[[package]]
 name = "steward-tls"
 version = "0.1.0"
 dependencies = [
