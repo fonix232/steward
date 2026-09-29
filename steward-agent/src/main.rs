@@ -8,6 +8,10 @@
 //! certificate chains to that CA is accepted. Plain `ws://` needs
 //! `--allow-plaintext` (development only).
 //!
+//! Without `--controller`, the agent uses the controller on its own device when
+//! one is enabled there (the router that hosts it), and otherwise looks on the
+//! default gateway.
+//!
 //! Until the controller adopts the device, the agent has no credential and the
 //! controller sends it nothing. Adoption delivers one (`steward.adopt`), kept in
 //! `<state dir>/credential`; the agent presents it on every connection, as
@@ -102,10 +106,20 @@ async fn main() {
     loop {
         let url = match &controller {
             Some(url) => url.clone(),
-            None => match device::default_gateway() {
-                Some(gw) => format!("wss://{gw}:{}", proto::PORT),
-                None => {
-                    log!("no controller given and no default gateway to look for one on");
+            None => match (
+                tokio::task::spawn_blocking(device::local_controller_port)
+                    .await
+                    .ok()
+                    .flatten(),
+                device::default_gateway(),
+            ) {
+                // The router hosting the controller: its own, not its default gateway (the ISP).
+                (Some(port), _) => format!("wss://127.0.0.1:{port}"),
+                (None, Some(gw)) => format!("wss://{gw}:{}", proto::PORT),
+                (None, None) => {
+                    log!(
+                        "no controller given, none on this device, and no default gateway to look for one on"
+                    );
                     sleep(backoff.after(None)).await;
                     continue;
                 }

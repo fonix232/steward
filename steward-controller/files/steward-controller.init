@@ -14,7 +14,7 @@ start_service() {
 	mkdir -p /etc/steward/configs
 	chmod 700 /etc/steward
 	procd_open_instance
-	procd_set_param command /usr/sbin/steward-controller --listen "[::]:$device_port" --state-dir /etc/steward
+	procd_set_param command /usr/sbin/steward-controller --listen "[::]:$device_port" --state-dir /etc/steward --adopt-local
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1

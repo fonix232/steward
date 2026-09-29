@@ -64,7 +64,7 @@ const LOG_TEXT: usize = 128;
 /// Why a pending device is disconnected when newer ones take its place.
 const TOO_MANY_PENDING: &str = "too many devices waiting for adoption";
 
-const USAGE: &str = "usage: steward-controller [--listen <address:port>] [--state-dir <dir>] [--config-dir <dir>] [--control <socket>] [--plaintext]
+const USAGE: &str = "usage: steward-controller [--listen <address:port>] [--state-dir <dir>] [--config-dir <dir>] [--control <socket>] [--plaintext] [--adopt-local]
        steward-controller [--control <socket>] devices | adopt <serial> | forget <serial>";
 
 struct Args {
@@ -75,6 +75,8 @@ struct Args {
     control: PathBuf,
     /// Serve plain ws:// (development only).
     plaintext: bool,
+    /// Adopt devices connecting over loopback: the controller's own host (the init script).
+    adopt_local: bool,
     /// A control command instead of serving: `devices`, `adopt <serial>`, `forget <serial>`.
     command: Option<Request>,
 }
@@ -87,6 +89,7 @@ impl Args {
             config_dir: None,
             control: PathBuf::from("/var/run/steward-controller.sock"),
             plaintext: false,
+            adopt_local: false,
             command: None,
         };
         let usage = || -> ! {
@@ -105,6 +108,7 @@ impl Args {
                 "--config-dir" => a.config_dir = Some(it.next().unwrap_or_else(|| usage()).into()),
                 "--control" => a.control = it.next().unwrap_or_else(|| usage()).into(),
                 "--plaintext" => a.plaintext = true,
+                "--adopt-local" => a.adopt_local = true,
                 "devices" => a.command = Some(Request::Devices),
                 "adopt" => {
                     a.command = Some(Request::Adopt {
@@ -203,6 +207,19 @@ async fn main() {
         }
     });
 
+    // --adopt-local adopts this host's own agent, which it knows by the host's serial.
+    let adopt_local: Option<Arc<str>> = if args.adopt_local {
+        let own = proto::host_serial();
+        if own.is_none() {
+            log!(
+                "--adopt-local: this host has no serial (no label MAC or Ethernet address) to know its agent by; adopting nothing by itself"
+            );
+        }
+        own.map(Arc::from)
+    } else {
+        None
+    };
+
     let scheme = if acceptor.is_some() { "wss" } else { "ws" };
     log!("listening for devices on {scheme}://{}", args.listen);
     let handshakes = Arc::new(Semaphore::new(HANDSHAKES));
@@ -217,9 +234,18 @@ async fn main() {
             Ok((tcp, addr)) => {
                 let (registry, config_dir, acceptor) =
                     (registry.clone(), config_dir.clone(), acceptor.clone());
+                let adopt_local = adopt_local.clone();
                 tokio::spawn(async move {
-                    let result =
-                        connection(tcp, addr, acceptor, registry, config_dir, handshake).await;
+                    let result = connection(
+                        tcp,
+                        addr,
+                        acceptor,
+                        registry,
+                        config_dir,
+                        adopt_local,
+                        handshake,
+                    )
+                    .await;
                     if let Err(e) = result {
                         // It can quote the device (serde's errors do).
                         log!("{addr}: {}", clip(&e.to_string()));
@@ -256,13 +282,14 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
     acceptor: Option<TlsAcceptor>,
     registry: Shared,
     config_dir: Arc<PathBuf>,
+    adopt_local: Option<Arc<str>>,
     handshake: OwnedSemaphorePermit,
 ) -> Result<(), Error> {
     let Some(acceptor) = acceptor else {
-        return serve(stream, addr, registry, config_dir, handshake).await;
+        return serve(stream, addr, registry, config_dir, adopt_local, handshake).await;
     };
     match timeout(TLS_TIMEOUT, acceptor.accept(stream)).await {
-        Ok(Ok(tls)) => serve(tls, addr, registry, config_dir, handshake).await,
+        Ok(Ok(tls)) => serve(tls, addr, registry, config_dir, adopt_local, handshake).await,
         Ok(Err(e)) => Err(format!("TLS handshake: {e}").into()),
         Err(_) => Err("no TLS handshake in time".into()),
     }
@@ -272,7 +299,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
 /// `handshake`, its slot among the connections that haven't sent one, and it has
 /// [`UPGRADE_TIMEOUT`] for the upgrade and then [`CONNECT_TIMEOUT`] to get there. Its messages
 /// are at most [`MAX_MESSAGE`] bytes, and after `connect` it's dropped once it has sent
-/// nothing for [`SILENCE`].
+/// nothing for [`SILENCE`]. `adopt_local` is this host's serial with `--adopt-local`.
 // tungstenite's upgrade callback returns its own (large) error response type.
 #[allow(clippy::result_large_err)]
 async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
@@ -280,6 +307,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     addr: SocketAddr,
     registry: Shared,
     config_dir: Arc<PathBuf>,
+    adopt_local: Option<Arc<str>>,
     handshake: OwnedSemaphorePermit,
 ) -> Result<(), Error> {
     let limits = WebSocketConfig::default()
@@ -340,13 +368,32 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         let mut guard = registry.lock().await;
         let reg = &mut *guard;
         let connected = &reg.connected;
-        let admission = reg.devices.admit(
+        let mut admission = reg.devices.admit(
             &serial,
             credential.as_deref(),
             model,
             &connect.firmware,
             |s| connected.contains_key(s),
         )?;
+        // The controller's own host is adopted without asking, and again if it lost its
+        // credential: its agent connects over loopback (only processes on the host can) and
+        // reports the host's serial. Any serial claimed over loopback isn't enough, and a device
+        // adopted from the network is never taken over this way.
+        if adopt_local.as_deref() == Some(serial.as_str())
+            && is_loopback(addr.ip())
+            && matches!(admission, Admission::Pending | Admission::Refused)
+        {
+            if reg.devices.readopt(&serial)? {
+                if let Some(credential) = reg.devices.issue(&serial)? {
+                    log!("{serial} is this controller's own host: adopting it");
+                    admission = Admission::Deliver(credential);
+                }
+            } else {
+                log!(
+                    "{serial} from {addr}: adopted from the network, so not adopted again by itself"
+                );
+            }
+        }
         for dropped in reg.devices.take_dropped() {
             if let Some(d) = reg.connected.get(&dropped) {
                 let _ = d.tx.try_send(Outgoing::Close(TOO_MANY_PENDING));
@@ -441,6 +488,16 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     result
 }
 
+/// Loopback, including IPv4 loopback seen through a dual-stack `[::]` socket (::ffff:127.0.0.1).
+fn is_loopback(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(v6.is_loopback(), |v4| v4.is_loopback()),
+    }
+}
+
 async fn next_message<S: AsyncRead + AsyncWrite + Unpin>(
     ws: &mut tokio_tungstenite::WebSocketStream<S>,
 ) -> Result<Option<Message>, Error> {
@@ -523,11 +580,13 @@ async fn handle(serial: &str, m: Message, registry: &Shared, config_dir: &Path) 
             let mut reg = registry.lock().await;
             let is_adoption = reg.connected.get(serial).and_then(|d| d.adopt_id) == Some(id);
             if is_adoption {
+                let mut over_loopback = false;
                 if let Some(d) = reg.connected.get_mut(serial) {
                     d.adopt_id = None;
+                    over_loopback = is_loopback(d.addr.ip());
                 }
                 if result.as_ref().is_some_and(|r| r.status.error == 0) {
-                    match reg.devices.delivered(serial) {
+                    match reg.devices.delivered(serial, over_loopback) {
                         Ok(()) => log!("{serial}: adopted"),
                         Err(e) => log!("{serial}: {e}"),
                     }
@@ -700,9 +759,11 @@ mod tests {
         let (registry, config_dir) = (registry.clone(), Arc::new(PathBuf::from("/nonexistent")));
         let task = tokio::spawn(async move {
             let addr = "192.0.2.10:40000".parse().unwrap();
-            connection(controller, addr, acceptor, registry, config_dir, handshake)
-                .await
-                .map_err(|e| e.to_string())
+            connection(
+                controller, addr, acceptor, registry, config_dir, None, handshake,
+            )
+            .await
+            .map_err(|e| e.to_string())
         });
         (device, task)
     }
@@ -1025,5 +1086,222 @@ mod tests {
         there.close(None).await.unwrap();
         task.await.unwrap().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn loopback_includes_ipv4_seen_on_a_dual_stack_socket() {
+        for (ip, local) in [
+            ("127.0.0.1", true),
+            ("::1", true),
+            ("::ffff:127.0.0.1", true),
+            ("192.0.2.10", false),
+            ("::ffff:192.0.2.10", false),
+            ("2001:db8::1", false),
+        ] {
+            assert_eq!(is_loopback(ip.parse().unwrap()), local, "{ip}");
+        }
+    }
+
+    const HOST: &str = "00005e005301";
+    const AP: &str = "00005e005302";
+    const REMOTE: &str = "192.0.2.10:40000";
+    const LOOPBACK: &str = "[::ffff:127.0.0.1]:40000";
+
+    type Device = (
+        WebSocketStream<DuplexStream>,
+        JoinHandle<Result<(), String>>,
+    );
+
+    /// A device connecting from `addr` as `serial`, presenting `credential`, to a controller
+    /// whose own host is `own` (`--adopt-local`): its WebSocket, once `connect` is sent.
+    async fn device(
+        registry: &Shared,
+        config_dir: &Path,
+        addr: &str,
+        own: Option<&str>,
+        credential: Option<&str>,
+        serial: &str,
+    ) -> Device {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let (device, controller) = tokio::io::duplex(1 << 16);
+        let handshake = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let (registry, config_dir) = (registry.clone(), Arc::new(config_dir.to_owned()));
+        let (addr, own) = (addr.parse().unwrap(), own.map(Arc::from));
+        let task = tokio::spawn(async move {
+            serve(controller, addr, registry, config_dir, own, handshake)
+                .await
+                .map_err(|e| e.to_string())
+        });
+        let mut request = "ws://controller/".into_client_request().unwrap();
+        if let Some(c) = credential {
+            let bearer = format!("Bearer {c}").parse().unwrap();
+            request.headers_mut().insert("authorization", bearer);
+        }
+        let (mut ws, _) = tokio_tungstenite::client_async(request, device)
+            .await
+            .unwrap();
+        let hello = proto::Connect {
+            serial: serial.into(),
+            uuid: 0,
+            firmware: "OpenWrt".into(),
+            wanip: vec![],
+            capabilities: json!({}),
+        };
+        send(
+            &mut ws,
+            event::CONNECT,
+            serde_json::to_value(hello).unwrap(),
+        )
+        .await;
+        (ws, task)
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Got {
+        Command(u64, String, Value),
+        /// With the close frame's code, if there was one.
+        Closed(Option<u16>),
+        Nothing,
+    }
+
+    /// What the controller sends next, within a second.
+    async fn next(ws: &mut WebSocketStream<DuplexStream>) -> Got {
+        match timeout(Duration::from_secs(1), ws.next()).await {
+            Err(_) => Got::Nothing,
+            Ok(Some(Ok(Frame::Text(t)))) => match serde_json::from_str(&t).unwrap() {
+                Message::Request {
+                    id, method, params, ..
+                } => Got::Command(id, method, params),
+                other => panic!("{other:?}"),
+            },
+            Ok(Some(Ok(Frame::Close(f)))) => Got::Closed(f.map(|f| u16::from(f.code))),
+            Ok(None | Some(Err(_))) => Got::Closed(None),
+            Ok(Some(Ok(other))) => panic!("{other:?}"),
+        }
+    }
+
+    async fn answer(ws: &mut WebSocketStream<DuplexStream>, id: u64, serial: &str) {
+        let r = proto::CommandResult {
+            serial: serial.into(),
+            uuid: None,
+            status: proto::CommandStatus {
+                error: 0,
+                text: String::new(),
+                when: None,
+                rejected: vec![],
+            },
+        };
+        let m = Message::result(id, r).unwrap();
+        ws.send(Frame::text(serde_json::to_string(&m).unwrap()))
+            .await
+            .unwrap();
+    }
+
+    /// Takes the credential `steward.adopt` brings, and confirms it.
+    async fn take_credential(ws: &mut WebSocketStream<DuplexStream>, serial: &str) -> String {
+        let Got::Command(id, method, params) = next(ws).await else {
+            panic!("no credential for {serial}")
+        };
+        assert_eq!(method, command::ADOPT);
+        answer(ws, id, serial).await;
+        params["credential"].as_str().unwrap().to_owned()
+    }
+
+    async fn hang_up((mut ws, task): Device) {
+        let _ = ws.close(None).await;
+        let _ = task.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adopt_local_adopts_only_this_hosts_own_serial_over_loopback() {
+        let (dir, registry) = registry("own");
+        let cfg = dir.join("configs");
+        // Another serial over loopback, the host's from the network, or the host's without
+        // --adopt-local: pending, like anything else.
+        for (addr, own, serial) in [
+            (LOOPBACK, Some(HOST), AP),
+            (REMOTE, Some(HOST), HOST),
+            (LOOPBACK, None, HOST),
+        ] {
+            let mut d = device(&registry, &cfg, addr, own, None, serial).await;
+            assert_eq!(
+                next(&mut d.0).await,
+                Got::Nothing,
+                "{addr} {own:?} {serial}"
+            );
+            hang_up(d).await;
+        }
+        // The host's own agent over loopback, with it: adopted by itself.
+        let mut d = device(&registry, &cfg, LOOPBACK, Some(HOST), None, HOST).await;
+        let first = take_credential(&mut d.0, HOST).await;
+        assert_eq!(next(&mut d.0).await, Got::Nothing);
+        hang_up(d).await;
+        {
+            let reg = registry.lock().await;
+            assert!(reg.devices.is_adopted(HOST));
+            assert!(reg.devices.all()[HOST].adopted_over_loopback);
+            assert_eq!(reg.devices.all()[AP].standing, devices::Standing::Pending);
+        }
+        // Having lost its credential, it's adopted again, and the old one stops working.
+        let mut d = device(&registry, &cfg, "127.0.0.1:40001", Some(HOST), None, HOST).await;
+        let second = take_credential(&mut d.0, HOST).await;
+        hang_up(d).await;
+        let mut d = device(&registry, &cfg, REMOTE, Some(HOST), Some(&first), HOST).await;
+        assert_eq!(next(&mut d.0).await, Got::Closed(Some(1008)));
+        hang_up(d).await;
+        let mut d = device(
+            &registry,
+            &cfg,
+            "[::1]:40002",
+            Some(HOST),
+            Some(&second),
+            HOST,
+        )
+        .await;
+        assert_eq!(next(&mut d.0).await, Got::Nothing);
+        hang_up(d).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adopt_local_never_takes_over_a_device_adopted_from_the_network() {
+        let (dir, registry) = registry("takeover");
+        let cfg = dir.join("configs");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let config = json!({ "uuid": 9, "interfaces": [] }).to_string();
+        std::fs::write(cfg.join(format!("{AP}.json")), config).unwrap();
+        // An access point connects from the network, and is adopted and provisioned.
+        let mut ap = device(&registry, &cfg, REMOTE, Some(HOST), None, AP).await;
+        assert_eq!(next(&mut ap.0).await, Got::Nothing);
+        control_request(Request::Adopt { serial: AP.into() }, &registry, &cfg).await;
+        let credential = take_credential(&mut ap.0, AP).await;
+        let Got::Command(id, method, params) = next(&mut ap.0).await else {
+            panic!("no configuration")
+        };
+        assert_eq!(
+            (method.as_str(), params["uuid"].as_u64()),
+            (command::CONFIGURE, Some(9))
+        );
+        answer(&mut ap.0, id, AP).await;
+        hang_up(ap).await;
+
+        // A local process claims its serial, without its credential: refused, and sent
+        // nothing. So it would be even were the AP's serial taken for the host's own.
+        for own in [HOST, AP] {
+            let mut local = device(&registry, &cfg, LOOPBACK, Some(own), None, AP).await;
+            assert_eq!(next(&mut local.0).await, Got::Closed(Some(1008)), "{own}");
+            hang_up(local).await;
+        }
+        // The access point keeps its credential, and its configuration.
+        let mut ap = device(&registry, &cfg, REMOTE, Some(HOST), Some(&credential), AP).await;
+        let Got::Command(_, method, params) = next(&mut ap.0).await else {
+            panic!("the AP wasn't admitted")
+        };
+        assert_eq!(
+            (method.as_str(), params["uuid"].as_u64()),
+            (command::CONFIGURE, Some(9))
+        );
+        hang_up(ap).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

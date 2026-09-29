@@ -147,6 +147,33 @@ pub struct Adopt {
     pub credential: String,
 }
 
+/// uCentral's serial: the device's label MAC address, lower case, without separators. The
+/// label MAC comes from board.json, else the first Ethernet interface's. The agent reports it
+/// in `connect`, and the controller knows its own host by it ([`host_serial`]).
+pub fn serial(board_json: &Value) -> String {
+    let mac = board_json
+        .pointer("/system/label_macaddr")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            ["eth0", "lan1", "lan", "wan"]
+                .iter()
+                .find_map(|i| std::fs::read_to_string(format!("/sys/class/net/{i}/address")).ok())
+        })
+        .unwrap_or_default();
+    mac.trim().to_lowercase().replace(':', "")
+}
+
+/// The serial of the device this runs on, from `/etc/board.json`: `None` when it has neither
+/// a label MAC nor an Ethernet address.
+pub fn host_serial() -> Option<String> {
+    let board_json: Value = std::fs::read_to_string("/etc/board.json")
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    Some(serial(&board_json)).filter(|s| !s.is_empty())
+}
+
 /// `connect`: the first event on every connection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Connect {
@@ -246,6 +273,12 @@ mod tests {
 
     fn parse(v: Value) -> Message {
         serde_json::from_value(v).expect("parses")
+    }
+
+    #[test]
+    fn the_serial_is_the_label_mac_without_separators() {
+        let board = json!({ "system": { "label_macaddr": "00:00:5E:00:53:01\n" } });
+        assert_eq!(serial(&board), "00005e005301");
     }
 
     #[test]

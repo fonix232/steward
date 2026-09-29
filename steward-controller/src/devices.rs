@@ -45,6 +45,14 @@ pub struct Record {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firmware: Option<String>,
+    /// It took its credential over loopback: the controller's own host, which `--adopt-local`
+    /// may adopt again. A device adopted from the network never is.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub adopted_over_loopback: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 /// What a connecting device gets.
@@ -208,6 +216,7 @@ impl Devices {
                 adopted_at: None,
                 model: None,
                 firmware: None,
+                adopted_over_loopback: false,
             });
         record.model = model.map(clip).or(record.model.take());
         record.firmware = Some(clip(firmware));
@@ -277,6 +286,24 @@ impl Devices {
         self.save()
     }
 
+    /// Adopt the controller's own host (`--adopt-local`) without asking: pending, or adopted
+    /// over loopback before and it lost its credential. Its old credential stops working, and
+    /// [`Devices::issue`] gives it a new one. A device adopted from the network is never taken
+    /// over this way, whoever claims its serial: false, and it keeps its credential.
+    pub fn readopt(&mut self, serial: &str) -> Result<bool, Error> {
+        let record = self
+            .records
+            .get_mut(serial)
+            .ok_or_else(|| Error(format!("no device {serial} has connected")))?;
+        if record.standing == Standing::Adopted && !record.adopted_over_loopback {
+            return Ok(false);
+        }
+        record.standing = Standing::Adopting;
+        record.credential_sha256 = None;
+        self.save()?;
+        Ok(true)
+    }
+
     /// Issue a credential to a device being adopted that is connected now.
     pub fn issue(&mut self, serial: &str) -> Result<Option<String>, Error> {
         match self.records.get_mut(serial) {
@@ -290,14 +317,15 @@ impl Devices {
         }
     }
 
-    /// The device confirmed it stored its credential.
-    pub fn delivered(&mut self, serial: &str) -> Result<(), Error> {
+    /// The device confirmed it stored its credential, on a connection over loopback or not.
+    pub fn delivered(&mut self, serial: &str, over_loopback: bool) -> Result<(), Error> {
         if let Some(r) = self.records.get_mut(serial)
             && r.standing == Standing::Adopting
             && r.credential_sha256.is_some()
         {
             r.standing = Standing::Adopted;
             r.adopted_at = Some(now());
+            r.adopted_over_loopback = over_loopback;
             self.save()?;
         }
         Ok(())
@@ -355,7 +383,7 @@ mod tests {
         let credential = d.issue(serial).unwrap().expect("a credential");
         assert_eq!(credential.len(), 64);
         assert!(!d.is_adopted(serial));
-        d.delivered(serial).unwrap();
+        d.delivered(serial, false).unwrap();
         assert!(d.is_adopted(serial));
         assert!(d.adopt(serial).is_err(), "adopting twice");
 
@@ -423,7 +451,7 @@ mod tests {
             panic!("expected a new credential")
         };
         assert_ne!(credential, second);
-        d.delivered(serial).unwrap();
+        d.delivered(serial, false).unwrap();
         assert_eq!(
             d.admit(serial, Some(&credential), None, "OpenWrt", offline)
                 .unwrap(),
@@ -434,6 +462,62 @@ mod tests {
                 .unwrap(),
             Admission::Admitted
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn readopting_replaces_the_credential() {
+        let (dir, mut d) = store("readopt");
+        let serial = "00005e005304";
+        d.admit(serial, None, None, "OpenWrt", offline).unwrap();
+        d.adopt(serial).unwrap();
+        let old = d.issue(serial).unwrap().unwrap();
+        d.delivered(serial, true).unwrap();
+        // The host lost its credential: re-adopted, the old one no longer works.
+        assert!(d.readopt(serial).unwrap());
+        assert!(!d.is_adopted(serial));
+        let new = d.issue(serial).unwrap().unwrap();
+        d.delivered(serial, true).unwrap();
+        assert_eq!(
+            d.admit(serial, Some(&old), None, "OpenWrt", offline)
+                .unwrap(),
+            Admission::Refused
+        );
+        assert_eq!(
+            d.admit(serial, Some(&new), None, "OpenWrt", offline)
+                .unwrap(),
+            Admission::Admitted
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_device_adopted_from_the_network_is_never_readopted() {
+        let (dir, mut d) = store("network");
+        let serial = "00005e005305";
+        d.admit(serial, None, None, "OpenWrt", offline).unwrap();
+        d.adopt(serial).unwrap();
+        let credential = d.issue(serial).unwrap().unwrap();
+        d.delivered(serial, false).unwrap();
+        // Also after a restart: it keeps its standing and its credential.
+        let mut d = Devices::load(&dir.join("devices.json")).unwrap();
+        assert!(!d.all()[serial].adopted_over_loopback);
+        assert!(!d.readopt(serial).unwrap());
+        assert!(d.is_adopted(serial));
+        assert_eq!(d.issue(serial).unwrap(), None);
+        assert_eq!(
+            d.admit(serial, Some(&credential), None, "OpenWrt", offline)
+                .unwrap(),
+            Admission::Admitted
+        );
+        // A pending device, and one adopted over loopback, can be.
+        d.admit("00005e005306", None, None, "OpenWrt", offline)
+            .unwrap();
+        assert!(d.readopt("00005e005306").unwrap());
+        d.issue("00005e005306").unwrap().unwrap();
+        d.delivered("00005e005306", true).unwrap();
+        let d = Devices::load(&dir.join("devices.json")).unwrap();
+        assert!(d.all()["00005e005306"].adopted_over_loopback);
         fs::remove_dir_all(dir).unwrap();
     }
 

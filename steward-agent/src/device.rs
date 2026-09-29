@@ -15,7 +15,7 @@ pub fn identity() -> Result<proto::Connect, steward_ubus::Error> {
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
     Ok(proto::Connect {
-        serial: serial(&board_json),
+        serial: proto::serial(&board_json),
         uuid: running_uuid(),
         firmware: board
             .get("release")
@@ -26,23 +26,6 @@ pub fn identity() -> Result<proto::Connect, steward_ubus::Error> {
         wanip: vec![],
         capabilities: capabilities(&board, &board_json),
     })
-}
-
-/// uCentral's serial: the device's label MAC address, lower case, without
-/// separators. The label MAC comes from board.json, else the first
-/// Ethernet interface's.
-fn serial(board_json: &Value) -> String {
-    let mac = board_json
-        .pointer("/system/label_macaddr")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| {
-            ["eth0", "lan1", "lan", "wan"]
-                .iter()
-                .find_map(|i| std::fs::read_to_string(format!("/sys/class/net/{i}/address")).ok())
-        })
-        .unwrap_or_default();
-    mac.trim().to_lowercase().replace(':', "")
 }
 
 /// The configuration the device runs: 0 until one from the controller is
@@ -97,6 +80,32 @@ pub fn state() -> Result<Value, steward_ubus::Error> {
             "memory": info.get("memory"),
         }
     }))
+}
+
+/// The port of a controller enabled on this very device (the router that hosts it), read
+/// from its UCI config through ubus: `None` when there's none, or it's off.
+pub fn local_controller_port() -> Option<u16> {
+    if !std::path::Path::new("/usr/sbin/steward-controller").exists() {
+        return None;
+    }
+    let mut ubus = Ubus::connect().ok()?;
+    let args = json!({ "config": "steward-controller", "section": "controller" });
+    let values = ubus.call("uci", "get", args.as_object()?).ok()?;
+    let section = values.get("values")?;
+    let on = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .is_some_and(|s| matches!(s, "1" | "on" | "yes" | "true"))
+    };
+    if !on(section.get("enabled")) {
+        return None;
+    }
+    Some(
+        section
+            .get("device_port")
+            .and_then(Value::as_str)
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(proto::PORT),
+    )
 }
 
 /// The IPv4 default gateway, from /proc/net/route.
