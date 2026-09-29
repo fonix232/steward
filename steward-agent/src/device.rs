@@ -53,29 +53,6 @@ fn capabilities(board: &Map<String, Value>, board_json: &Value) -> Value {
     })
 }
 
-/// The `state` event's document: uCentral's `unit` section.
-pub fn state() -> Result<Value, steward_ubus::Error> {
-    let mut ubus = Ubus::connect()?;
-    let info = ubus.call("system", "info", &Map::new())?;
-    let load: Vec<Value> = info
-        .get("load")
-        .and_then(Value::as_array)
-        .map(|l| {
-            l.iter()
-                .map(|v| json!(v.as_f64().unwrap_or(0.0) / 65536.0))
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(json!({
-        "unit": {
-            "load": load,
-            "localtime": info.get("localtime"),
-            "uptime": info.get("uptime"),
-            "memory": info.get("memory"),
-        }
-    }))
-}
-
 /// The port of a controller enabled on this very device (the router that hosts it), read
 /// from its UCI config through ubus: `None` when there's none, or it's off.
 pub fn local_controller_port() -> Option<u16> {

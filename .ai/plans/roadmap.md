@@ -20,6 +20,7 @@
 3. **Controller storage and API**: done. Devices, configurations, the latest state and the last `configure` answer persisted on the router, written on events only (STW-14); the API over HTTPS with sign-in through rpcd and Server-Sent Events (STW-15). State history (graphs) comes with State and topology.
 4. **steward-web**: devices, adoption, clients, and configuration editing.
 5. **State and topology**:
+   - device state: done (STW-18): unit with CPU load and temperatures, radios with channel utilisation, interfaces with their SSIDs, port links
    - clients (hostapd over ubus)
    - LLDP neighbours (lldpd)
    - per-device and per-client traffic (nlbwmon or conntrack accounting)

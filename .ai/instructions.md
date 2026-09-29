@@ -10,7 +10,7 @@ crates/proto/         uCentral's messages (JSON-RPC 2.0) and a device's serial, 
 crates/render/        uCentral configuration to UCI changes (wireless, network): pure, tested against the wifi scripts' and netifd's options
 crates/tls/           the device channel's TLS: the controller's CA and certificates, the agent's pin
 crates/ubus/          a ubus client in Rust (no libubus), and uci::Transaction (rpcd's rollback)
-steward-agent/        package: Makefile, crate (main.rs: connection loop; device.rs: what it reports), files/
+steward-agent/        package: Makefile, crate (main.rs: connection loop; device.rs: identity; state.rs: the state document; apply.rs), files/
 steward-controller/   package: Makefile, crate (device registry, storage, provisioning, API), files/
 steward-web/          package: the web interface (www/)
 steward/              package: installs the other three

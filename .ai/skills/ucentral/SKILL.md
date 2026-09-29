@@ -30,6 +30,23 @@ JSON-RPC 2.0 over a WebSocket the device opens to the controller, on port 15002.
 - **`uuid`**: the configuration's number (a u64); 0 means none from a controller yet. The controller re-sends its stored configuration when a device reports another uuid.
 - **Compressed commands**: when the capabilities say `compress_cmd: true`, the controller may send `params` as `{compress_64, compress_sz}` (zlib, base64). Steward's agent doesn't advertise it.
 
+## State
+
+The agent's `state` event (every minute) follows TIP's `state/*.yml`. `steward-agent/src/state.rs` builds it: `gather()` reads the sources and `document()` is pure.
+- **`unit`**: load, `cpu_load` (total, then per core, % since the last report, from `/proc/stat`), `localtime`, uptime, `boottime`, memory, and `temperature` [average, maximum] of the CPU's thermal zones.
+  - `localtime` is unix time. OpenWrt's `system info` `localtime` is shifted by the timezone, so it isn't used.
+- **`radios`**, one per `network.wireless status` radio: phy, band, channel, `channel_width`, `channels`/`frequency` (every 20 MHz channel spanned), `tx_power`, temperature, `chanUtil`.
+  - Live values come from `iwinfo info` on one of the radio's interfaces. Its `htmode` is the operating one (a configured HT40 on 2.4 GHz may run at HT20); the `iwinfo` CLI prints the configured one.
+  - `iwinfo survey` needs an interface too: it's empty for a phy name. `chanUtil` is busy over active time on the channel since the last report. The survey counts per channel, so the first report on a new channel (or after a counter reset) has none.
+  - The temperature is the hwmon sensor whose `device` resolves to `.../ieee80211/<phy>`. The hwmon names use the driver's original phy numbers (`mt7915_phy1`), not the renamed phys.
+- **`interfaces`**, one per `network.interface dump` entry but loopback: name, uptime, ipv4 addresses, ipv6_addresses, dns_servers, counters (its L3 device's), `ssids`.
+  - Each SSID: bssid (its device's MAC), ssid, mode, band, phy, iface, frequency, `radio` (`#/radios/N`), counters, and `location` (`/interfaces/<i>/ssids/<s>`) for the agent's `stw_<i>_<s>_<band>` sections.
+- **`link-state`**: board.json's WAN ports as upstream, LAN ports as downstream: carrier, speed and duplex (netifd's `1000F`), counters.
+- Every field is picked by name: `network.wireless status` includes each SSID's key in its config.
+- Missing sources leave their parts out.
+- About 6 KB a report on bifrost (8 SSIDs, 5 ports).
+- Clients (`associations`) and LLDP peers aren't reported yet.
+
 ## Capabilities
 
 TIP builds them in `system/capabilities.uc` from `board.json`, nl80211 and `/etc/ucentral/*`: `compatible`, `model`, `platform` (`ap`/`switch`), `network` (ports per role), `wifi` (per phy path: bands, channels, htmode, antennas), `macaddr` and `country_codes`. Steward's agent sends a subset for now (`steward-agent/src/device.rs`).

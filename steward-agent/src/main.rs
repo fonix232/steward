@@ -24,6 +24,7 @@
 
 mod apply;
 mod device;
+mod state;
 
 use futures_util::{SinkExt, StreamExt};
 use std::path::{Path, PathBuf};
@@ -118,6 +119,8 @@ async fn main() {
     let pin = PinFile(state_dir.join("controller-ca.pem"));
     let credential = Credential(state_dir.join("credential"));
     let state = apply::State::new(&state_dir);
+    // Kept across sessions, so the first report after a reconnect has rates too.
+    let previous = std::sync::Mutex::new(state::Previous::default());
 
     // Reconnect for ever, backing off to a minute. Without a controller
     // given, it is on the default gateway (the router, which usually hosts
@@ -150,6 +153,7 @@ async fn main() {
             pin: &pin,
             credential: &credential,
             state: &state,
+            previous: &previous,
         };
         let mut connected = None;
         match session(&ctx, &mut connected).await {
@@ -195,6 +199,8 @@ struct Ctx<'a> {
     pin: &'a PinFile,
     credential: &'a Credential,
     state: &'a apply::State,
+    /// What the next state report's rates start from.
+    previous: &'a std::sync::Mutex<state::Previous>,
 }
 
 /// A stream the WebSocket runs over: TCP, or TLS on TCP.
@@ -274,7 +280,13 @@ async fn session(ctx: &Ctx<'_>, connected: &mut Option<Instant>) -> Result<(), E
     let mut info = tokio::task::spawn_blocking(device::identity).await??;
     info.uuid = ctx.state.running().uuid;
     log!("connected to {} as {}", ctx.url, info.serial);
-    talk(ws, info, device::state, ctx, connected).await
+    talk(ws, info, report, ctx, connected).await
+}
+
+/// The device's state report: what it gathers now, with rates since the `previous` one.
+fn report(previous: &mut state::Previous) -> Result<serde_json::Value, steward_ubus::Error> {
+    let sources = state::gather()?;
+    Ok(state::document(&sources, previous))
 }
 
 /// Whether the controller can be reached right now, within `timeout`: a fresh connection,
@@ -326,13 +338,13 @@ impl Credential {
     }
 }
 
-/// The session's messages: `connect`, then the device's `state` (read by `state`) and a ping
+/// The session's messages: `connect`, then the device's `state` (made by `state`) and a ping
 /// every [`STATE_INTERVAL`], and answers to the controller's commands. It ends when the
 /// controller closes the connection, or when it has sent nothing for [`SILENCE`].
 async fn talk<S: AsyncRead + AsyncWrite + Unpin>(
     mut ws: WebSocketStream<S>,
     info: proto::Connect,
-    state: fn() -> Result<serde_json::Value, steward_ubus::Error>,
+    state: fn(&mut state::Previous) -> Result<serde_json::Value, steward_ubus::Error>,
     ctx: &Ctx<'_>,
     connected: &mut Option<Instant>,
 ) -> Result<(), Error> {
@@ -373,7 +385,13 @@ async fn talk<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
             _ = tick.tick() => {
-                let state = tokio::task::spawn_blocking(state).await??;
+                let mut previous = std::mem::take(&mut *ctx.previous.lock().unwrap());
+                let (state, previous) = tokio::task::spawn_blocking(move || {
+                    let doc = state(&mut previous)?;
+                    Ok::<_, steward_ubus::Error>((doc, previous))
+                })
+                .await??;
+                *ctx.previous.lock().unwrap() = previous;
                 let uuid = ctx.state.running().uuid;
                 let params = proto::State { serial: serial.clone(), uuid, request_uuid: None, state };
                 send(&mut ws, Message::notification(event::STATE, &params)?).await?;
@@ -648,10 +666,11 @@ mod tests {
             pin: Box::leak(Box::new(PinFile(dir.join("controller-ca.pem")))),
             credential: Box::leak(Box::new(Credential(dir.join("credential")))),
             state: Box::leak(Box::new(apply::State::new(&dir))),
+            previous: Box::leak(Box::default()),
         }
     }
 
-    fn state() -> Result<serde_json::Value, steward_ubus::Error> {
+    fn state(_: &mut state::Previous) -> Result<serde_json::Value, steward_ubus::Error> {
         Ok(serde_json::json!({ "unit": {} }))
     }
 
@@ -796,6 +815,7 @@ mod tests {
         let pin = PinFile(dir.join("agent/controller-ca.pem"));
         let credential = Credential(dir.join("agent/credential"));
         let state = apply::State::new(&dir.join("agent"));
+        let previous = std::sync::Mutex::default();
         let session = async |url: &str| {
             let mut connected = None;
             let ctx = Ctx {
@@ -803,6 +823,7 @@ mod tests {
                 pin: &pin,
                 credential: &credential,
                 state: &state,
+                previous: &previous,
             };
             let s = session(&ctx, &mut connected);
             tokio::time::timeout(Duration::from_secs(10), s)
@@ -852,11 +873,13 @@ mod tests {
         }
         let pin = PinFile(dir.join("controller-ca.pem"));
         let credential = Credential(dir.join("credential"));
+        let previous = std::sync::Mutex::new(state::Previous::default());
         let ctx = Ctx {
             url: "wss://127.0.0.1:1",
             pin: &pin,
             credential: &credential,
             state: &state,
+            previous: &previous,
         };
         let out = f(&ctx).await;
         let _ = std::fs::remove_dir_all(&dir);

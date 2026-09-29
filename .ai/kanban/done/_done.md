@@ -15,3 +15,4 @@
 13. [STW-11: Apply configurations](011-apply-configurations.md)
 14. [STW-13: Networks and VLANs](013-networks-and-vlans.md)
 15. [STW-14: Controller storage](014-controller-storage.md)
+16. [STW-18: Device state and health](018-device-state-and-health.md)
