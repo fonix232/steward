@@ -2,7 +2,7 @@
 
 A free and open-source network controller for OpenWrt, aiming at the experience UniFi gives: install it on the router, and the access points, switches and other OpenWrt devices on the network are adopted and managed from one web interface. Topology, per-device and per-client traffic, and IDS/IPS are part of the plan.
 
-**Status: starting.** The design, the plan (`.ai/plans/roadmap.md`) and the task board (`.ai/kanban/`) are in place. So far there's the cargo workspace, uCentral's message types (`crates/proto`), and a ubus client in Rust (`crates/ubus`) whose answers match the `ubus` command's on a device; the agent, the controller and the packages are being brought up. The target is OpenWrt 25.12 and later, with apk packages.
+**Status: starting.** The design, the plan (`.ai/plans/roadmap.md`) and the task board (`.ai/kanban/`) are in place. So far there's the cargo workspace, uCentral's message types (`crates/proto`), and a ubus client in Rust (`crates/ubus`) whose answers match the `ubus` command's on a device, including UCI changes through rpcd with its rollback: a change that isn't confirmed reverts by itself. The agent, the controller and the packages are being brought up. The target is OpenWrt 25.12 and later, with apk packages.
 
 ## How it fits together (the design)
 

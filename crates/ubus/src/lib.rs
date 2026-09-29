@@ -9,6 +9,7 @@
 //! carrying the request's sequence number.
 
 pub mod blob;
+pub mod uci;
 
 use serde_json::{Map, Value};
 use std::io::{self, Read, Write};
