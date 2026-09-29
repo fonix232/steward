@@ -14,3 +14,4 @@
 12. [STW-15: Controller API](015-controller-api.md)
 13. [STW-11: Apply configurations](011-apply-configurations.md)
 14. [STW-13: Networks and VLANs](013-networks-and-vlans.md)
+15. [STW-14: Controller storage](014-controller-storage.md)

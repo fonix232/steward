@@ -17,7 +17,7 @@
 2. **The configuration renderer.**
    - Render a subset of uCentral's schema into sections the agent owns and marks: radios and SSIDs (done, `crates/render`), VLANs on the device's bridge with SSIDs on them (done, STW-13), then routed interfaces and DHCP.
    - Done for wireless (STW-11): applied through `uci::Transaction`, confirmed once the controller answers again, the running uuid persisted, and `configure` answered 0, 1 or 2 honestly.
-3. **Controller storage and API**: devices, configurations and state persisted on the router. The API is done (HTTPS, sign-in through rpcd, Server-Sent Events); storing state history is STW-14.
+3. **Controller storage and API**: done. Devices, configurations, the latest state and the last `configure` answer persisted on the router, written on events only (STW-14); the API over HTTPS with sign-in through rpcd and Server-Sent Events (STW-15). State history (graphs) comes with State and topology.
 4. **steward-web**: devices, adoption, clients, and configuration editing.
 5. **State and topology**:
    - clients (hostapd over ubus)

@@ -26,7 +26,7 @@ JSON-RPC 2.0 over a WebSocket the device opens to the controller, on port 15002.
   - `2`: not applied.
 
   Never answer 0 for a configuration that was changed or only partly applied. Steward's agent answers "nothing to change" (0 or 1) only while no apply is pending on the device, since a pending one may revert what the configuration matched (busy: retried, then 2). An apply it can't confirm is rolled back before it answers 2; should that fail, rpcd reverts it when its window ends, and until then it's the pending apply that keeps the next configuration waiting.
-- **`serial`**: the device's label MAC, lower case, no separators. It's private data, so redact it in logs.
+- **`serial`**: the device's label MAC, lower case, no separators. The controller closes a connection whose serial isn't 12 lower-case hex digits (1008). It's private data, so redact it in logs.
 - **`uuid`**: the configuration's number (a u64); 0 means none from a controller yet. The controller re-sends its stored configuration when a device reports another uuid.
 - **Compressed commands**: when the capabilities say `compress_cmd: true`, the controller may send `params` as `{compress_64, compress_sz}` (zlib, base64). Steward's agent doesn't advertise it.
 
@@ -102,8 +102,8 @@ TIP's devices trust the gateway CA they were provisioned with (`/etc/ucentral/op
 ## Adoption (Steward's, not uCentral's)
 
 uCentral has no adoption step: TIP's devices come with certificates. Steward adds one:
-- **Pending:** a device's first `connect` makes it pending. It stays connected for the controller's bookkeeping and is sent nothing. Pending devices are kept in memory only (anything that connects is one): at most 64, the oldest one that isn't connected dropped first, or when all are connected the oldest, disconnected with its record (so no more stay connected, and it's pending again when it reconnects), a controller restart forgets them until they connect again, and their model and firmware are cut to 128 bytes (a longer serial is refused). Only adopting and adopted devices are written to `devices.json`.
+- **Pending:** a device's first `connect` makes it pending. It stays connected for the controller's bookkeeping and is sent nothing. Pending devices are kept in memory only (anything that connects is one): at most 64, the oldest one that isn't connected dropped first, or when all are connected the oldest, disconnected with its record (so no more stay connected, and it's pending again when it reconnects), a controller restart forgets them until they connect again, and their model and firmware are cut to 128 bytes (a longer serial is refused). Their states aren't kept at all. Only adopting and adopted devices are written to `devices.json`.
 - **Adopting:** `steward-controller adopt <serial>` (the control socket, `/var/run/steward-controller.sock`) marks the device adopting. When it's connected, the controller sends `steward.adopt` with `{serial, credential}` (32 random bytes, hex). Once the agent answers error 0, the device is adopted.
-- **Adopted:** every later WebSocket upgrade must carry `Authorization: Bearer <credential>`. A missing or wrong one closes the connection with code 1008. The controller stores only the SHA-256, in `/etc/steward/devices.json` (0600).
+- **Adopted:** every later WebSocket upgrade must carry `Authorization: Bearer <credential>`. A missing or wrong one closes the connection with code 1008, and changes nothing: the record (model, firmware) and `devices.json` stay as they were. The controller stores only the SHA-256, in `/etc/steward/devices.json` (0600).
 - **Forgotten:** `steward-controller forget <serial>` drops the record, so the credential stops working and the device starts over as pending.
 - **Validity** runs 2020–2099, because devices without an RTC boot with their image's build date.

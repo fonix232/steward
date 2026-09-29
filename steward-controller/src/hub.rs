@@ -3,6 +3,8 @@
 //! both go through these operations.
 
 use crate::devices::{Devices, Standing};
+use crate::states::States;
+use crate::store;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -21,16 +23,22 @@ pub struct Device {
     pub addr: SocketAddr,
     /// The configuration it runs (uuid).
     pub uuid: u64,
-    pub state: Option<Value>,
+    /// What it reported on connecting.
+    pub capabilities: Value,
+    /// When the controller last heard from it.
+    pub seen: u64,
     /// Commands to send it.
     pub tx: mpsc::Sender<Outgoing>,
     /// The id of the `steward.adopt` command awaiting its answer.
     pub adopt_id: Option<u64>,
+    /// The id of the `configure` command awaiting its answer, and the uuid it carried.
+    pub configure: Option<(u64, u64)>,
 }
 
 pub struct Registry {
     pub connected: HashMap<String, Device>,
     pub devices: Devices,
+    pub states: States,
     pub next_id: u64,
 }
 
@@ -57,8 +65,7 @@ impl std::fmt::Display for OpError {
 }
 
 fn valid_serial(serial: &str) -> Result<(), OpError> {
-    // A MAC without separators: never a path.
-    if serial.len() == 12 && serial.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if store::valid_serial(serial) {
         Ok(())
     } else {
         Err(OpError::NotFound(format!("no device {serial}")))
@@ -66,11 +73,17 @@ fn valid_serial(serial: &str) -> Result<(), OpError> {
 }
 
 impl Hub {
-    pub fn new(devices: Devices, config_dir: PathBuf) -> Hub {
+    pub fn new(devices: Devices, mut states: States, config_dir: PathBuf) -> Hub {
+        // Only devices on record have a state: nothing else is kept, and a stored state
+        // left behind would show on a pending device of the same serial.
+        for e in states.retain(|serial| devices.all().contains_key(serial)) {
+            crate::log!("state: {e}");
+        }
         Hub {
             registry: Mutex::new(Registry {
                 connected: HashMap::new(),
                 devices,
+                states,
                 next_id: 0,
             }),
             config_dir,
@@ -89,8 +102,9 @@ impl Hub {
         self.events.subscribe()
     }
 
-    /// Every device the controller knows: its record, and whether it's connected, with what.
-    /// The credential's hash stays in devices.json: no answer carries it.
+    /// Every device the controller knows: its record, whether it's connected (and from
+    /// where, running what), and its latest state, live or the last one kept. The
+    /// credential's hash stays in devices.json: no answer carries it.
     pub async fn devices(&self) -> Value {
         let reg = self.registry.lock().await;
         let mut out = serde_json::Map::new();
@@ -101,13 +115,47 @@ impl Hub {
             }
             let live = reg.connected.get(serial);
             v["connected"] = json!(live.is_some());
+            let latest = reg.states.get(serial);
+            if let Some(l) = latest {
+                v["running"] = json!(l.uuid);
+                v["state"] = l.state.clone();
+                v["state_received"] = json!(l.received);
+            }
             if let Some(d) = live {
                 v["running"] = json!(d.uuid);
-                v["state"] = d.state.clone().unwrap_or(Value::Null);
+                v["last_seen"] = json!(d.seen);
+                v["address"] = json!(d.addr.ip().to_canonical().to_string());
+                if v.get("capabilities").is_none() {
+                    v["capabilities"] = d.capabilities.clone();
+                }
             }
             out.insert(serial.clone(), v);
         }
         Value::Object(out)
+    }
+
+    /// The controller is stopping: the connected devices were last seen now, and every
+    /// changed state is written.
+    pub async fn stop(&self) {
+        let mut reg = self.registry.lock().await;
+        let connected: Vec<String> = reg.connected.keys().cloned().collect();
+        let serials: Vec<&str> = connected.iter().map(String::as_str).collect();
+        if let Err(e) = reg.devices.seen(&serials) {
+            crate::log!("{e}");
+        }
+        drop(reg);
+        self.flush_states().await;
+    }
+
+    /// Writes every state that changed since it was last written.
+    pub async fn flush_states(&self) {
+        let (written, failed) = self.registry.lock().await.states.flush_all();
+        for e in failed {
+            crate::log!("state: {e}");
+        }
+        if written > 0 {
+            crate::log!("wrote {written} device state(s)");
+        }
     }
 
     pub async fn adopt(&self, serial: &str) -> Result<String, OpError> {
@@ -148,8 +196,16 @@ impl Hub {
                     let _ =
                         d.tx.try_send(Outgoing::Close("forgotten by the controller"));
                 }
+                // Its stored state and configuration go with it.
+                let mut failed: Vec<String> = reg.states.forget(serial).err().into_iter().collect();
+                if store::valid_serial(serial) {
+                    failed.extend(store::remove(&self.config_path(serial)).err());
+                }
                 drop(reg);
                 self.emit("forgotten", serial, Value::Null);
+                for e in &failed {
+                    crate::log!("{serial}: forgetting: {e}");
+                }
                 Ok(format!("forgot {serial}; its credential no longer works"))
             }
             Ok(false) => Err(OpError::NotFound(format!("no device {serial}"))),
@@ -203,12 +259,7 @@ impl Hub {
             .unwrap_or(0);
         let uuid = now.max(previous + 1);
         config["uuid"] = json!(uuid);
-        let io = |e: std::io::Error| OpError::Failed(e.to_string());
-        std::fs::create_dir_all(&self.config_dir).map_err(io)?;
-        let path = self.config_path(serial);
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&config).unwrap_or_default()).map_err(io)?;
-        std::fs::rename(&tmp, &path).map_err(io)?;
+        store::write_json(&self.config_path(serial), &config).map_err(OpError::Failed)?;
         self.emit("configuration", serial, json!({ "uuid": uuid }));
         self.provision(serial).await;
         Ok(uuid)
@@ -234,7 +285,7 @@ impl Hub {
         }
         reg.next_id += 1;
         let id = reg.next_id;
-        let Some(d) = reg.connected.get(serial) else {
+        let Some(d) = reg.connected.get_mut(serial) else {
             return;
         };
         if d.uuid == uuid {
@@ -249,6 +300,7 @@ impl Hub {
         match Message::request(id, command::CONFIGURE, &params) {
             Ok(m) => {
                 crate::log!("{serial}: sending configuration {uuid} (command {id})");
+                d.configure = Some((id, uuid));
                 let _ = d.tx.try_send(Outgoing::Send(m));
             }
             Err(e) => crate::log!("{serial}: {e}"),
@@ -277,5 +329,105 @@ impl Hub {
             }
             Err(e) => crate::log!("{serial}: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use steward_proto::CommandStatus;
+
+    const SERIAL: &str = "00005e005301";
+
+    fn open(dir: &std::path::Path) -> Hub {
+        let (states, skipped) = States::load(&dir.join("state"));
+        assert!(skipped.is_empty(), "{skipped:?}");
+        Hub::new(
+            Devices::load(&dir.join("devices.json")).unwrap(),
+            states,
+            dir.join("configs"),
+        )
+    }
+
+    #[tokio::test]
+    async fn what_the_controller_knows_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("steward-hub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = open(&dir);
+        {
+            let mut reg = hub.registry.lock().await;
+            let d = &mut reg.devices;
+            d.admit(SERIAL, None, Some("E8450"), "OpenWrt", |_| false)
+                .unwrap();
+            d.adopt(SERIAL).unwrap();
+            d.issue(SERIAL).unwrap();
+            d.delivered(SERIAL, false).unwrap();
+            d.connected(SERIAL, "192.0.2.4", &json!({ "model": "E8450" }))
+                .unwrap();
+            let status = CommandStatus {
+                error: 1,
+                text: "applied with substitutions".into(),
+                when: None,
+                rejected: vec![],
+            };
+            d.answered(SERIAL, 7, status).unwrap();
+            reg.states
+                .record(SERIAL, 7, json!({ "unit": { "load": [0.5] } }), true);
+        }
+        hub.set_config(SERIAL, json!({ "radios": [] }))
+            .await
+            .unwrap();
+        // Connected when the controller stops.
+        let (tx, _rx) = mpsc::channel(1);
+        hub.registry.lock().await.connected.insert(
+            SERIAL.into(),
+            Device {
+                addr: "192.0.2.4:40000".parse().unwrap(),
+                uuid: 7,
+                capabilities: json!({}),
+                seen: 0,
+                tx,
+                adopt_id: None,
+                configure: None,
+            },
+        );
+        // A state message wrote nothing; the controller stopping writes it, and when the
+        // device was last seen.
+        assert!(!dir.join("state").exists());
+        hub.stop().await;
+        drop(hub);
+        // A stored state whose device isn't on record (a forget whose removal failed) goes.
+        let orphan = dir.join("state").join("00005e0053ff.json");
+        std::fs::copy(dir.join("state").join(format!("{SERIAL}.json")), &orphan).unwrap();
+
+        let hub = open(&dir);
+        assert!(!orphan.exists());
+        assert!(
+            hub.registry
+                .lock()
+                .await
+                .states
+                .get("00005e0053ff")
+                .is_none()
+        );
+        let all = hub.devices().await;
+        let d = &all[SERIAL];
+        assert_eq!(d["standing"], "adopted");
+        assert_eq!(d["connected"], false);
+        assert_eq!(d["address"], "192.0.2.4");
+        assert_eq!(d["capabilities"]["model"], "E8450");
+        assert!(d["last_seen"].as_u64() >= d["last_connected"].as_u64());
+        assert_eq!(d["running"], 7);
+        assert_eq!(d["state"]["unit"]["load"][0], 0.5);
+        assert_eq!(d["last_answer"]["uuid"], 7);
+        assert_eq!(d["last_answer"]["status"]["error"], 1);
+        assert!(hub.config(SERIAL).unwrap().is_some());
+
+        // Forgotten: its record, stored state and configuration go.
+        hub.forget(SERIAL).await.unwrap();
+        assert!(!dir.join("state").join(format!("{SERIAL}.json")).exists());
+        assert!(!dir.join("configs").join(format!("{SERIAL}.json")).exists());
+        assert!(open(&dir).devices().await.get(SERIAL).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

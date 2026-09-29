@@ -83,9 +83,20 @@ where
     }
 }
 
-/// The command-line side: sends one request and prints the answer. The exit status is 0
-/// when the controller did what was asked.
-pub fn client(socket: &Path, req: Request) -> i32 {
+/// How long ago `t` was, briefly: `45s`, `12m`, `3h`, `2d`.
+fn ago(t: u64) -> String {
+    let s = crate::store::now().saturating_sub(t);
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s / 60),
+        3600..86400 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86400),
+    }
+}
+
+/// The command-line side: sends one request and prints the answer (`json`: as the
+/// controller gave it). The exit status is 0 when the controller did what was asked.
+pub fn client(socket: &Path, req: Request, json: bool) -> i32 {
     let stream = match std::os::unix::net::UnixStream::connect(socket) {
         Ok(s) => s,
         Err(e) => {
@@ -113,19 +124,32 @@ pub fn client(socket: &Path, req: Request) -> i32 {
             return 1;
         }
     };
+    if json {
+        let shown = if answer.devices.is_null() {
+            serde_json::to_value(&answer).unwrap_or_default()
+        } else {
+            answer.devices.clone()
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&shown).unwrap_or_default()
+        );
+        return if answer.ok { 0 } else { 1 };
+    }
     if let Value::Object(devices) = &answer.devices {
         if devices.is_empty() {
             println!("No device has connected yet.");
         }
         for (serial, d) in devices {
+            let connection = match (d["connected"].as_bool(), d["last_seen"].as_u64()) {
+                (Some(true), _) => "connected".to_string(),
+                (_, Some(t)) => format!("seen {} ago", ago(t)),
+                _ => "offline".to_string(),
+            };
             println!(
-                "{serial}  {:<9} {:<10} {}  {}",
+                "{serial}  {:<9} {:<14} {}  {}",
                 d["standing"].as_str().unwrap_or("?"),
-                if d["connected"].as_bool() == Some(true) {
-                    "connected"
-                } else {
-                    "offline"
-                },
+                connection,
                 d["model"].as_str().unwrap_or("-"),
                 d["firmware"].as_str().unwrap_or("-"),
             );

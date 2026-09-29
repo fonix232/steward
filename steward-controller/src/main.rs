@@ -12,7 +12,9 @@
 //! `steward-controller adopt <serial>`) and the HTTPS API (`api`, port 8443)
 //! both call. An adopted device's configuration lives in
 //! `<config dir>/<serial>.json`, a uCentral configuration whose `uuid` numbers
-//! it; a device reporting another uuid is sent it.
+//! it; a device reporting another uuid is sent it. Its latest state is kept in
+//! memory and written to `<state dir>/state/` (`states`) when it disconnects,
+//! hourly, and when the controller stops (SIGTERM, SIGINT).
 
 macro_rules! log {
     ($($t:tt)*) => { eprintln!("steward-controller: {}", format_args!($($t)*)) };
@@ -23,12 +25,15 @@ mod api;
 mod control;
 mod devices;
 mod hub;
+mod states;
+mod store;
 
 use control::{Answer, Request};
 use devices::{Admission, Devices};
 use futures_util::{SinkExt, StreamExt};
 use hub::{Device, Hub, Outgoing};
 use serde_json::{Value, json};
+use states::States;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -64,6 +69,9 @@ const ACCEPT_RETRY: Duration = Duration::from_secs(1);
 /// The largest message, and frame, a device may send: a state with 30 stations is about
 /// 23 KB. A bigger one ends the connection when its frame header arrives, before it's read.
 const MAX_MESSAGE: usize = 1 << 20;
+/// The most of a device's capabilities kept, in bytes (serialized): a real device reports a
+/// few KB. What 64 pending devices send stays bounded by it, not by [`MAX_MESSAGE`].
+const MAX_CAPABILITIES: usize = 64 << 10;
 /// A device that has sent nothing for this long is dropped: it went away without closing
 /// (powered off, unplugged). Agents send their state every minute.
 const SILENCE: Duration = Duration::from_secs(180);
@@ -74,7 +82,7 @@ const LOG_TEXT: usize = 128;
 const TOO_MANY_PENDING: &str = "too many devices waiting for adoption";
 
 const USAGE: &str = "usage: steward-controller [--listen <address:port>] [--web-listen <address:port>] [--state-dir <dir>] [--config-dir <dir>] [--control <socket>] [--plaintext] [--adopt-local]
-       steward-controller [--control <socket>] devices | adopt <serial> | forget <serial>";
+       steward-controller [--control <socket>] [--json] devices | adopt <serial> | forget <serial>";
 
 struct Args {
     listen: String,
@@ -90,6 +98,8 @@ struct Args {
     adopt_local: bool,
     /// A control command instead of serving: `devices`, `adopt <serial>`, `forget <serial>`.
     command: Option<Request>,
+    /// Print the control command's answer as JSON.
+    json: bool,
 }
 
 impl Args {
@@ -103,6 +113,7 @@ impl Args {
             plaintext: false,
             adopt_local: false,
             command: None,
+            json: false,
         };
         let usage = || -> ! {
             eprintln!("{USAGE}");
@@ -122,6 +133,7 @@ impl Args {
                 "--control" => a.control = it.next().unwrap_or_else(|| usage()).into(),
                 "--plaintext" => a.plaintext = true,
                 "--adopt-local" => a.adopt_local = true,
+                "--json" => a.json = true,
                 "devices" => a.command = Some(Request::Devices),
                 "adopt" => {
                     a.command = Some(Request::Adopt {
@@ -149,7 +161,7 @@ fn fail(e: impl std::fmt::Display) -> ! {
 async fn main() {
     let args = Args::parse();
     if let Some(req) = args.command {
-        std::process::exit(control::client(&args.control, req));
+        std::process::exit(control::client(&args.control, req, args.json));
     }
     let listener = TcpListener::bind(&args.listen)
         .await
@@ -166,7 +178,40 @@ async fn main() {
         .config_dir
         .clone()
         .unwrap_or_else(|| args.state_dir.join("configs"));
-    let hub = Arc::new(Hub::new(devices, config_dir));
+    let (states, skipped) = States::load(&args.state_dir.join("state"));
+    for e in skipped {
+        log!("skipped a stored state: {e}");
+    }
+    let hub = Arc::new(Hub::new(devices, states, config_dir));
+
+    // States are written hourly when they changed, and when the controller stops.
+    let h = hub.clone();
+    tokio::spawn(async move {
+        let mut hourly = tokio::time::interval(std::time::Duration::from_secs(3600));
+        hourly.tick().await;
+        loop {
+            hourly.tick().await;
+            h.flush_states().await;
+        }
+    });
+    let h = hub.clone();
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut term), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            log!("can't catch SIGTERM and SIGINT: states are written hourly only");
+            return;
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        h.stop().await;
+        log!("stopping");
+        std::process::exit(0);
+    });
 
     let (socket, h) = (args.control.clone(), hub.clone());
     tokio::spawn(async move {
@@ -337,7 +382,25 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     if serial.len() > LOG_TEXT {
         return Err(format!("a serial of {} bytes", serial.len()).into());
     }
+    if !store::valid_serial(&serial) {
+        log!("{addr}: refused: {serial:?} isn't a serial (12 lower-case hex digits)");
+        let _ = ws
+            .close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: "not a serial".into(),
+            }))
+            .await;
+        return Ok(());
+    }
     let model = connect.capabilities.get("model").and_then(Value::as_str);
+    // Kept while it's connected (and on flash once it's adopted), so bounded: more than a real
+    // device reports isn't kept at all.
+    let capabilities = if connect.capabilities.to_string().len() <= MAX_CAPABILITIES {
+        connect.capabilities.clone()
+    } else {
+        log!("{serial}: capabilities over {MAX_CAPABILITIES} bytes aren't kept");
+        Value::Null
+    };
     let (tx, mut rx) = mpsc::channel::<Outgoing>(8);
     // Admitted and registered as connected under one lock, and a pending device dropped to
     // make room past MAX_PENDING (the oldest that isn't connected, or when all are, the
@@ -379,20 +442,36 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         if admission != Admission::Refused {
+            // Over the limit, an adopted device keeps what it reported before (its own MACs,
+            // which the client list leaves out, among it).
+            let capabilities = if capabilities.is_null() {
+                let stored = reg.devices.all().get(&serial);
+                stored
+                    .and_then(|r| r.capabilities.clone())
+                    .unwrap_or(Value::Null)
+            } else {
+                capabilities.clone()
+            };
             let replaced = reg.connected.insert(
                 serial.clone(),
                 Device {
                     addr,
                     uuid: connect.uuid,
-                    state: None,
+                    capabilities: capabilities.clone(),
+                    seen: store::now(),
                     tx: tx.clone(),
                     adopt_id: None,
+                    configure: None,
                 },
             );
             if let Some(old) = replaced {
                 let _ = old
                     .tx
                     .try_send(Outgoing::Close("the device connected again"));
+            }
+            let address = addr.ip().to_canonical().to_string();
+            if let Err(e) = reg.devices.connected(&serial, &address, &capabilities) {
+                log!("{serial}: {e}");
             }
         }
         admission
@@ -467,6 +546,13 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let mut reg = hub.registry.lock().await;
     if reg.connected.get(&serial).is_some_and(|d| d.addr == addr) {
         reg.connected.remove(&serial);
+        // Its last state and when it was last seen are kept for when it's offline.
+        if let Err(e) = reg.devices.seen(&[&serial]) {
+            log!("{serial}: {e}");
+        }
+        if let Err(e) = reg.states.flush(&serial) {
+            log!("{serial}: state: {e}");
+        }
         drop(reg);
         hub.emit("disconnected", &serial, Value::Null);
     }
@@ -499,32 +585,43 @@ async fn next_message<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 async fn handle(serial: &str, m: Message, hub: &Hub) {
+    if let Some(d) = hub.registry.lock().await.connected.get_mut(serial) {
+        d.seen = store::now();
+    }
     match m {
         Message::Notification { method, params, .. } => match method.as_str() {
             event::STATE => {
                 let uuid = params.get("uuid").and_then(Value::as_u64);
+                let state = params.get("state").cloned().unwrap_or(Value::Null);
                 let mut reg = hub.registry.lock().await;
                 let adopted = reg.devices.is_adopted(serial);
-                if let Some(d) = reg.connected.get_mut(serial) {
-                    d.state = params.get("state").cloned();
-                    let stale = uuid.is_some_and(|u| u != d.uuid);
-                    d.uuid = uuid.unwrap_or(d.uuid);
-                    let load = d
-                        .state
-                        .as_ref()
-                        .and_then(|s| s.pointer("/unit/load"))
-                        .cloned();
-                    log!(
-                        "{serial}: state (configuration {}, load {})",
-                        d.uuid,
-                        clip(&load.clone().unwrap_or_default().to_string())
-                    );
-                    let state = d.state.clone().unwrap_or(Value::Null);
-                    drop(reg);
-                    hub.emit("state", serial, state);
-                    if stale && adopted {
-                        hub.provision(serial).await;
-                    }
+                let Some(d) = reg.connected.get_mut(serial) else {
+                    return;
+                };
+                let stale = uuid.is_some_and(|u| u != d.uuid);
+                d.uuid = uuid.unwrap_or(d.uuid);
+                let running = d.uuid;
+                log!(
+                    "{serial}: state (configuration {running}, load {})",
+                    clip(
+                        &state
+                            .pointer("/unit/load")
+                            .cloned()
+                            .unwrap_or_default()
+                            .to_string()
+                    )
+                );
+                // Anything that connects is pending: what a pending device sends is neither
+                // kept nor passed on, and its page shows it's pending. An adopted device's
+                // state is kept in memory, and written later.
+                if !adopted {
+                    return;
+                }
+                reg.states.record(serial, running, state.clone(), adopted);
+                drop(reg);
+                hub.emit("state", serial, state);
+                if stale {
+                    hub.provision(serial).await;
                 }
             }
             event::PING | event::HEALTHCHECK => {}
@@ -545,14 +642,25 @@ async fn handle(serial: &str, m: Message, hub: &Hub) {
             let is_adoption = reg.connected.get(serial).and_then(|d| d.adopt_id) == Some(id);
             if is_adoption {
                 let mut over_loopback = false;
+                let mut seen = None;
                 if let Some(d) = reg.connected.get_mut(serial) {
                     d.adopt_id = None;
                     over_loopback = is_loopback(d.addr.ip());
+                    seen = Some((
+                        d.addr.ip().to_canonical().to_string(),
+                        d.capabilities.clone(),
+                    ));
                 }
                 if result.as_ref().is_some_and(|r| r.status.error == 0) {
                     match reg.devices.delivered(serial, over_loopback) {
                         Ok(()) => log!("{serial}: adopted"),
                         Err(e) => log!("{serial}: {e}"),
+                    }
+                    // Now adopted, its connection is recorded as an adopted device's.
+                    if let Some((address, capabilities)) = seen
+                        && let Err(e) = reg.devices.connected(serial, &address, &capabilities)
+                    {
+                        log!("{serial}: {e}");
                     }
                     drop(reg);
                     hub.emit("adopted", serial, Value::Null);
@@ -564,6 +672,17 @@ async fn handle(serial: &str, m: Message, hub: &Hub) {
                     );
                 }
                 return;
+            }
+            // The answer to a configuration: kept with the device.
+            let configured = reg.connected.get_mut(serial).and_then(|d| {
+                d.configure
+                    .filter(|(cid, _)| *cid == id)
+                    .inspect(|_| d.configure = None)
+            });
+            if let (Some((_, uuid)), Some(r)) = (configured, &result)
+                && let Err(e) = reg.devices.answered(serial, uuid, r.status.clone())
+            {
+                log!("{serial}: {e}");
             }
             drop(reg);
             match (&result, &outcome) {
@@ -639,7 +758,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("steward-conn-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let devices = Devices::load(&dir.join("devices.json")).unwrap();
-        let hub = Hub::new(devices, dir.join("configs"));
+        let (states, _) = crate::states::States::load(&dir.join("state"));
+        let hub = Hub::new(devices, states, dir.join("configs"));
         (dir, Arc::new(hub))
     }
 
@@ -807,6 +927,33 @@ mod tests {
         assert!(err.contains("Message too long"), "{err}");
         assert!(registry.registry.lock().await.connected.is_empty());
         assert_eq!(slots.available_permits(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capabilities_past_the_limit_are_not_kept() {
+        let ((dir, registry), slots) = (registry("caps"), Arc::new(Semaphore::new(1)));
+        for (serial, size, kept) in [
+            ("00005e005301", 100, true),
+            ("00005e005302", MAX_CAPABILITIES + 1, false),
+        ] {
+            let (device, task) = open(&registry, &slots, None);
+            let mut ws = upgrade(device).await;
+            let capabilities = json!({ "model": "E8450", "x": "f".repeat(size) });
+            let connect = json!({ "serial": serial, "uuid": 0, "firmware": "OpenWrt",
+                                  "capabilities": capabilities });
+            send(&mut ws, event::CONNECT, connect).await;
+            sleep(Duration::from_millis(1)).await;
+            let reg = registry.registry.lock().await;
+            assert_eq!(
+                reg.connected[serial].capabilities.is_null(),
+                !kept,
+                "{serial}"
+            );
+            drop(reg);
+            ws.close(None).await.unwrap();
+            task.await.unwrap().unwrap();
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1176,6 +1323,169 @@ mod tests {
         .await;
         assert_eq!(next(&mut d.0).await, Got::Nothing);
         hang_up(d).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Anything that connects is pending, so what a pending device sends isn't kept (in
+    /// memory or on flash) or passed on, however many connect and however big their states:
+    /// 64 records, no states. An adopted device's state is kept, listed and streamed, and
+    /// goes when it's forgotten, with one that arrives before its connection closes.
+    #[tokio::test(start_paused = true)]
+    async fn only_an_adopted_devices_state_is_kept() {
+        let (dir, registry) = registry("states");
+        let cfg = dir.join("configs");
+        let mut events = registry.subscribe();
+        // The serials of the states streamed since last asked.
+        let drain = |events: &mut tokio::sync::broadcast::Receiver<Value>| {
+            let mut serials = vec![];
+            while let Ok(e) = events.try_recv() {
+                if e["event"] == "state" {
+                    serials.push(e["serial"].as_str().unwrap().to_owned());
+                }
+            }
+            serials
+        };
+        let mut streamed = vec![];
+        let serial = |i: usize| format!("00005e{i:06x}");
+        let big = "x".repeat(64 * 1024);
+        let n = devices::MAX_PENDING + 16;
+        for i in 0..n {
+            let mut d = device(&registry, &cfg, REMOTE, None, None, &serial(i)).await;
+            let state = json!({ "serial": serial(i), "uuid": 0, "state": { "junk": big } });
+            send(&mut d.0, event::STATE, state).await;
+            sleep(Duration::from_millis(1)).await;
+            hang_up(d).await;
+            streamed.extend(drain(&mut events));
+        }
+        {
+            let reg = registry.registry.lock().await;
+            assert_eq!(reg.devices.all().len(), devices::MAX_PENDING);
+            let kept = (0..n).filter(|i| reg.states.get(&serial(*i)).is_some());
+            assert_eq!(kept.count(), 0, "pending devices' states kept");
+        }
+        assert!(streamed.is_empty(), "{streamed:?}");
+        assert!(!dir.join("state").exists());
+
+        let mut ap = device(&registry, &cfg, REMOTE, None, None, AP).await;
+        assert_eq!(next(&mut ap.0).await, Got::Nothing);
+        control_request(Request::Adopt { serial: AP.into() }, &registry).await;
+        take_credential(&mut ap.0, AP).await;
+        let state = json!({ "serial": AP, "uuid": 0, "state": { "unit": { "load": [0.5] } } });
+        send(&mut ap.0, event::STATE, state).await;
+        sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            registry.devices().await[AP]["state"]["unit"]["load"][0],
+            0.5
+        );
+        assert_eq!(drain(&mut events), [AP]);
+
+        control_request(Request::Forget { serial: AP.into() }, &registry).await;
+        let late = json!({ "serial": AP, "uuid": 0, "state": { "late": true } });
+        let late = Message::notification(event::STATE, late).unwrap();
+        let _ =
+            ap.0.send(Frame::text(serde_json::to_string(&late).unwrap()))
+                .await;
+        hang_up(ap).await;
+        assert!(registry.registry.lock().await.states.get(AP).is_none());
+        registry.stop().await;
+        assert!(!dir.join("state").join(format!("{AP}.json")).exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A device connecting as `serial`, presenting `credential`, reporting `firmware` and
+    /// `model`: its WebSocket, once `connect` is sent.
+    async fn claim(
+        registry: &Arc<Hub>,
+        serial: &str,
+        credential: Option<&str>,
+        firmware: &str,
+        model: &str,
+    ) -> Device {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let (device, controller) = tokio::io::duplex(1 << 16);
+        let handshake = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let registry = registry.clone();
+        let task = tokio::spawn(async move {
+            serve(
+                controller,
+                REMOTE.parse().unwrap(),
+                registry,
+                None,
+                handshake,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        });
+        let mut request = "ws://controller/".into_client_request().unwrap();
+        if let Some(c) = credential {
+            let bearer = format!("Bearer {c}").parse().unwrap();
+            request.headers_mut().insert("authorization", bearer);
+        }
+        let (mut ws, _) = tokio_tungstenite::client_async(request, device)
+            .await
+            .unwrap();
+        let hello = proto::Connect {
+            serial: serial.into(),
+            uuid: 0,
+            firmware: firmware.into(),
+            wanip: vec![],
+            capabilities: json!({ "model": model }),
+        };
+        let hello = serde_json::to_value(hello).unwrap();
+        send(&mut ws, event::CONNECT, hello).await;
+        (ws, task)
+    }
+
+    /// Anyone who sees an adopted device's MAC can claim its serial: without its credential,
+    /// the connection is closed and changes nothing, not the record and not devices.json.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_connection_leaves_the_record_and_flash_alone() {
+        let (dir, registry) = registry("refused");
+        let mut ap = claim(&registry, AP, None, "OpenWrt 25.12.0", "E8450").await;
+        assert_eq!(next(&mut ap.0).await, Got::Nothing);
+        control_request(Request::Adopt { serial: AP.into() }, &registry).await;
+        let credential = take_credential(&mut ap.0, AP).await;
+        sleep(Duration::from_millis(1)).await;
+        hang_up(ap).await;
+        let path = dir.join("devices.json");
+        let listed = registry.devices().await[AP].clone();
+        assert_eq!(listed["firmware"], "OpenWrt 25.12.0");
+        // Any write would put it back.
+        std::fs::remove_file(&path).unwrap();
+        for presented in [None, Some("forged")] {
+            let mut d = claim(&registry, AP, presented, "IMPOSTOR", "IMPOSTOR").await;
+            assert_eq!(
+                next(&mut d.0).await,
+                Got::Closed(Some(1008)),
+                "{presented:?}"
+            );
+            hang_up(d).await;
+        }
+        assert!(
+            !path.exists(),
+            "devices.json written for a refused connection"
+        );
+        assert_eq!(registry.devices().await[AP], listed);
+        // The device itself: admitted, and what it reports now is kept.
+        let ap = claim(&registry, AP, Some(&credential), "OpenWrt 25.12.1", "E8450").await;
+        sleep(Duration::from_millis(1)).await;
+        hang_up(ap).await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("OpenWrt 25.12.1") && !text.contains("IMPOSTOR"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The agent sends its serial in lower case: upper case would make one MAC two devices.
+    #[tokio::test(start_paused = true)]
+    async fn an_upper_case_serial_is_refused() {
+        let (dir, registry) = registry("case");
+        let cfg = dir.join("configs");
+        for serial in ["00005E005302", "00005e00530A"] {
+            let mut d = device(&registry, &cfg, REMOTE, None, None, serial).await;
+            assert_eq!(next(&mut d.0).await, Got::Closed(Some(1008)), "{serial}");
+            hang_up(d).await;
+        }
+        assert!(registry.devices().await.as_object().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

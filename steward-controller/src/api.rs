@@ -659,6 +659,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let hub = Arc::new(Hub::new(
             Devices::load(&dir.join("devices.json")).unwrap(),
+            crate::states::States::load(&dir.join("state")).0,
             dir.join("configs"),
         ));
         // A device that has connected once: pending.
