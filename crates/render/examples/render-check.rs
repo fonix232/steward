@@ -1,8 +1,9 @@
 //! render-check <config.json>: renders a uCentral configuration against this device's
-//! wireless config and stages the result in an rpcd session of its own, prints the staged
-//! changes and the rejections, then discards it all: nothing is applied, no radio reloads.
+//! wireless and network configs and stages the result in an rpcd session of its own, prints
+//! the staged changes and the rejections, then discards it all: nothing is applied, no radio
+//! or network reloads.
 use serde_json::{Map, Value, json};
-use steward_render::{Op, wireless};
+use steward_render::{Current, Network, Op, Ports, Wireless, render};
 use steward_ubus::Ubus;
 use steward_ubus::uci::Transaction;
 
@@ -10,14 +11,14 @@ fn main() {
     let path = std::env::args().nth(1).expect("config.json");
     let config: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let mut ubus = Ubus::connect().unwrap();
-    let current = ubus
-        .call(
-            "uci",
-            "get",
-            json!({ "config": "wireless" }).as_object().unwrap(),
-        )
-        .unwrap();
-    let mut current = steward_render::Wireless::from_uci(&current);
+    let mut get = |name: &str| {
+        ubus.call("uci", "get", json!({ "config": name }).as_object().unwrap())
+            .unwrap()
+    };
+    let (wireless, network) = (get("wireless"), get("network"));
+    let board: Value =
+        serde_json::from_str(&std::fs::read_to_string("/etc/board.json").unwrap()).unwrap();
+    let mut current = Wireless::from_uci(&wireless);
     // What each radio supports, as `iwinfo info` reports it for its phy.
     let status = ubus
         .call("network.wireless", "status", &Map::new())
@@ -33,14 +34,21 @@ fn main() {
     for r in &current.radios {
         println!("radio {} ({}): htmodes {:?}", r.section, r.band, r.htmodes);
     }
-    let plan = wireless(&config, &current);
+    let plan = render(
+        &config,
+        &Current {
+            wireless: &current,
+            network: &Network::from_uci(&network),
+            ports: &Ports::from_board(&board),
+        },
+    );
     for r in &plan.rejected {
         match &r.substitution {
             Some(s) => println!("substituted: {} ({}): {s}", r.parameter, r.reason),
             None => println!("rejected: {} ({})", r.parameter, r.reason),
         }
     }
-    let mut t = Transaction::open(&["wireless"]).unwrap();
+    let mut t = Transaction::open(&["network", "wireless"]).unwrap();
     for op in &plan.ops {
         let result = match op {
             Op::Add {

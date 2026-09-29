@@ -56,16 +56,32 @@ So Steward renders the schema itself (`crates/render`), into UCI sections the ag
   - Ownership: a `wifi-iface` is the agent's only when it's named `stw_*` and marked `steward '1'`. Only those are deleted when the configuration no longer has them: a section of the user's that carries the marker isn't one.
   - Encryption: none, owe, psk, psk2, psk-mixed, sae, sae-mixed. Keys are 8 to 63 printable characters (hostapd reads its config a line at a time, so a newline would add a line) or 64 hex digits; SAE modes take only the former, because the scripts write a 64-hex key as `wpa_psk` and leave SAE without a password. No `encryption` is an open network; an `encryption` without a `proto` refuses the SSID rather than opening it. A `key` on a mode that takes none (none, owe) is rejected, redacted, and the SSID runs as its proto says: dropped quietly, it would answer 0 for an SSID its operator believes is keyed.
   - MFP: `ieee80211w` is `disabled` (the default), `optional` or `required`, TIP's values; anything else refuses the SSID rather than running it with less protection than asked. sae and owe run with it required, sae-mixed at least optional (its SAE clients need it), none and psk (WPA1) without it (the scripts write `ieee80211w=0` there); an `ieee80211w` asked otherwise is a substitution, so the answer says what runs.
-  - Network: the device's `lan`, until STW-13. So an interface asking for a VLAN is refused with its SSIDs (they'd run on the `lan`), and an interface that isn't an object, a `role` other than `upstream` or `downstream`, and any other interface key are rejected.
+  - Network: its interface's (below).
+- **Interfaces** are layer-2 networks (`crates/render/src/network.rs`):
+  - An interface is an object; anything else is refused (read as one without fields, it would be the device's `lan`). `role` is TIP's `upstream` or `downstream`; both render alike, so another value is rejected on its own.
+  - Without `vlan`: the device's own `lan`, untouched.
+  - With `vlan.id`: a VLAN on the device's VLAN-filtering bridge (`br-lan` when there are several). A bridge filters when `vlan_filtering` is set or it has `bridge-vlan` sections.
+    - The VLAN already exists (a `bridge-vlan` for the id): joined as it is, and so is an interface already on `<bridge>.<vid>`. Ports asked for that differ from the VLAN's are rejected, not applied, and so are ports the board lacks, as for a new VLAN.
+    - Otherwise: an owned `bridge-vlan` `stw_bv<vid>`, and an owned `interface` `stw_vlan<vid>` (proto none) unless one exists.
+    - Its ports come from `ethernet[].select-ports`: `LAN*`, `LANn`, `WAN*`, `WANn` against board.json's port roles. Without `ethernet`, it's tagged on every bridge port.
+    - `vlan-tag` is TIP's `tagged`, `un-tagged` or `auto` (the default, taken as tagged); `untagged` is taken as `un-tagged`. Any other value is rejected with its entry's ports, never read as tagged.
+    - An `ethernet` entry that isn't an object, a `select-ports` that isn't a list, and a port name that isn't a string are rejected; the rest of the selection applies.
+    - An untagged port must be untagged in no other VLAN.
+    - A port selected both tagged and un-tagged for one new VLAN keeps its first selection; the later one is rejected, naming the port.
+  - Refused with its SSIDs: a `vlan` without an `id` (it isn't the untagged `lan` either), a `vlan.proto` other than `802.1q` (the default), and an `ethernet` that isn't a list (read as none, it would tag the VLAN on every port). `ethernet` on an interface without a VLAN is refused on its own: the device's `lan` keeps its ports, so it selects nothing, and the SSIDs stay on `lan`.
+  - A refused interface's SSIDs are refused with it, never moved to another network.
+  - Ownership: a network section is the agent's only when it's named `stw_*` and marked `steward '1'`. A user's VLAN or interface that carries the marker is joined like anyone's, and never deleted.
+  - The agent stages `network` and `wireless` in one transaction, so one rollback covers both.
 - **Handled keys** (anything else is rejected as `<key> isn't supported yet`, so an ignored field never gets answer 0):
   - top level: `uuid`, `radios`, `interfaces`;
-  - interface: `name`, `role`, `vlan` (refused with its SSIDs), `ssids`;
   - radio: `band`, `channel`, `channel-mode`, `channel-width`, `country`, `tx-power`, `enable`;
+  - interface: `name`, `role`, `vlan` (`id`, `proto`), `ethernet` (`select-ports`, `vlan-tag`), `ssids`, `ipv4`;
   - SSID: `name`, `wifi-bands`, `bss-mode`, `encryption`, `hidden-ssid`, `isolate-clients`;
   - encryption: `proto`, `key`, `ieee80211w`.
 
   A value of the wrong kind (`"20"` for a tx power, `"yes"` for a boolean, an SSID without bands) is rejected, never guessed at.
 - **Rejected** (the answer's `rejected` list):
+  - any `ipv4` that asks for something (all but `addressing: none` and `send-hostname: true`): the device keeps its own addressing, and anything else in it would be dropped; a bridge that doesn't filter VLANs; VLAN ids outside 1 to 4094, or used twice; ports the board or the bridge lacks, or already untagged elsewhere;
   - bands the device lacks; `5G-lower`/`5G-upper`, `HaLow`;
   - channels, widths and modes the band or the radio doesn't have (above);
   - mesh and WDS modes;
@@ -74,7 +90,7 @@ So Steward renders the schema itself (`crates/render`), into UCI sections the ag
   - raw hostapd lines.
 
   A rejection shows what was sent, redacted: every value under a key naming a key, password, passphrase or secret, and raw lines (`*-raw`), become `…`, however deep.
-- `tests/wireless-schema.json` lists the options the wifi scripts read (from `/usr/share/schema/wireless.*.json`). A test checks every written option against it.
+- `tests/wireless-schema.json` lists the options the wifi scripts read (from `/usr/share/schema/wireless.*.json`), and `tests/network-schema.json` those netifd reads (its `vlan_attrs` and `iface_attrs`). Tests check every written option against them.
 
 ## TLS and trust
 

@@ -848,47 +848,6 @@ fn an_op_shows_names_not_values() {
     }
 }
 
-/// Until networks and VLANs (STW-13) every SSID runs on the device's lan, so an interface is
-/// checked like everything else: an interface asking for a VLAN is refused with its SSIDs
-/// (they'd run on the lan), and keys it doesn't handle are rejected, never dropped.
-#[test]
-fn interfaces_are_checked_before_their_ssids_run_on_the_lan() {
-    let open = json!({ "name": "O", "wifi-bands": ["5G"] });
-    let cases = [
-        (
-            json!({ "vlan": { "id": 20 }, "ssids": [open] }),
-            "VLANs aren't supported yet",
-            false,
-        ),
-        (
-            json!({ "ipv4": { "addressing": "static" }, "ssids": [open] }),
-            "ipv4 isn't supported yet",
-            true,
-        ),
-        (
-            json!({ "ethernet": [], "ssids": [open] }),
-            "ethernet isn't supported yet",
-            true,
-        ),
-        (
-            json!({ "role": "sideways", "ssids": [open] }),
-            "a role is upstream or downstream",
-            true,
-        ),
-        (json!("guest"), "an interface is an object", false),
-    ];
-    for (iface, want, runs) in cases {
-        let plan = wireless(&json!({ "interfaces": [iface] }), &current());
-        assert!(reasons(&plan).contains(want), "{want}: {}", reasons(&plan));
-        assert_eq!(find(&plan, "stw_0_0_5g").is_some(), runs, "{want}");
-    }
-    let plan = wireless(
-        &json!({ "interfaces": [{ "name": "LAN", "role": "downstream", "ssids": [open] }] }),
-        &current(),
-    );
-    assert!(plan.rejected.is_empty(), "{}", reasons(&plan));
-}
-
 /// A passphrase is printable: a newline would add a line to hostapd's config. SAE takes no
 /// 64-hex key: the scripts would write it as a PSK and leave SAE without a password.
 #[test]

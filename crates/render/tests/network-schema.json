@@ -1,0 +1,33 @@
+{
+ "source": "openwrt/netifd 06d06c86d757 (2026-09-11): config.c vlan_attrs (and the \"device\" option config_parse_vlan reads for the bridge), interface.c iface_attrs",
+ "bridge-vlan": [
+  "device",
+  "vlan",
+  "local",
+  "ports",
+  "alias"
+ ],
+ "interface": [
+  "device",
+  "proto",
+  "ifname",
+  "auto",
+  "zone",
+  "jail",
+  "jail_device",
+  "jail_ifname",
+  "host_device",
+  "defaultroute",
+  "peerdns",
+  "metric",
+  "dns",
+  "renew",
+  "dns_search",
+  "dns_metric",
+  "interface",
+  "delegate",
+  "force_link",
+  "tags",
+  "carrier_loss_delay"
+ ]
+}

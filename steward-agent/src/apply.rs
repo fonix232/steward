@@ -20,7 +20,7 @@ use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use steward_proto::{CommandStatus, Rejection, configure_error};
-use steward_render::{Op, Plan, Wireless};
+use steward_render::{Current, Network, Op, Plan, Ports, Wireless};
 use steward_ubus::Ubus;
 use steward_ubus::uci::Transaction;
 
@@ -158,17 +158,22 @@ fn unchanged(t: &mut Transaction, before: &[(&str, &Map<String, Value>)]) -> Res
     Ok(true)
 }
 
-/// Renders `config` against the device's wireless config, records the radio options it's
-/// about to replace, stages the changes and applies them with a `rollback` window. Blocking.
+/// Renders `config` against the device's wireless and network configs, records the radio
+/// options it's about to replace, stages the changes to both in one transaction and applies
+/// them with a `rollback` window. Blocking.
 pub fn stage(state: &State, config: &Value, rollback: Duration) -> Result<Staged, String> {
     let mut ubus = Ubus::connect().map_err(|e| e.to_string())?;
-    let current = ubus
-        .call(
-            "uci",
-            "get",
-            json!({ "config": "wireless" }).as_object().unwrap(),
-        )
-        .map_err(|e| format!("reading the wireless config: {e}"))?;
+    let mut get = |name: &str| {
+        ubus.call("uci", "get", json!({ "config": name }).as_object().unwrap())
+            .map_err(|e| format!("reading the {name} config: {e}"))
+    };
+    let current = get("wireless")?;
+    let network_uci = get("network")?;
+    let network = Network::from_uci(&network_uci);
+    let board: Value = std::fs::read_to_string("/etc/board.json")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
     let mut wireless = Wireless::from_uci(&current);
     // What each radio runs (`iwinfo info` on its phy), so it's never set to a mode it lacks.
     let status = ubus
@@ -182,11 +187,18 @@ pub fn stage(state: &State, config: &Value, rollback: Duration) -> Result<Staged
         )
         .ok()
     });
-    let plan = steward_render::wireless(config, &wireless);
+    let plan = steward_render::render(
+        config,
+        &Current {
+            wireless: &wireless,
+            network: &network,
+            ports: &Ports::from_board(&board),
+        },
+    );
     if plan.ops.is_empty() {
         return nothing(plan, Transaction::pending);
     }
-    let mut t = Transaction::open(&["wireless"]).map_err(|e| e.to_string())?;
+    let mut t = Transaction::open(&["network", "wireless"]).map_err(|e| e.to_string())?;
     for op in &plan.ops {
         match op {
             Op::Add {
@@ -204,7 +216,7 @@ pub fn stage(state: &State, config: &Value, rollback: Duration) -> Result<Staged
         }
         .map_err(|e| staging_failed(op, e))?;
     }
-    if unchanged(&mut t, &[("wireless", &current)])? {
+    if unchanged(&mut t, &[("network", &network_uci), ("wireless", &current)])? {
         // Every value was already what the plan sets.
         return nothing(plan, Transaction::pending);
     }

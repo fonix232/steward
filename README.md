@@ -2,7 +2,7 @@
 
 A free and open-source network controller for OpenWrt, aiming at the experience UniFi gives: install it on the router, and the access points, switches and other OpenWrt devices on the network are adopted and managed from one web interface. Topology, per-device and per-client traffic, and IDS/IPS are part of the plan.
 
-**Status: early.** The agent connects to the controller over TLS (`wss://`), pinning the controller's certificate authority the first time it connects, and reports what the device is and its state (load, memory, uptime). With no controller given, it looks for one on its default gateway. A new device waits as pending until it's adopted (`steward-controller adopt <serial>`); adoption gives it a credential it presents from then on. The router's own agent is adopted by itself. The controller sends an adopted device its stored configuration (`/etc/steward/configs/<serial>.json`). The agent applies the WiFi part (radios and SSIDs) with a rollback: it confirms only once it can reach the controller again, and otherwise the device returns to the previous configuration by itself. The controller also serves an HTTPS API on port 8443, for the coming web interface and for scripts. You sign in with the router's own accounts, as for LuCI; it covers devices, adoption, configurations, and a live event stream. Networks and VLANs, and the web interface, come next.
+**Status: early.** The agent connects to the controller over TLS (`wss://`), pinning the controller's certificate authority the first time it connects, and reports what the device is and its state (load, memory, uptime). With no controller given, it looks for one on its default gateway. A new device waits as pending until it's adopted (`steward-controller adopt <serial>`); adoption gives it a credential it presents from then on. The router's own agent is adopted by itself. The controller sends an adopted device its stored configuration (`/etc/steward/configs/<serial>.json`). The agent applies radios, SSIDs, and networks with their VLANs (joining a device's own VLANs, adding new ones in sections it owns) with a rollback: it confirms only once it can reach the controller again, and otherwise the device returns to the previous configuration by itself. The controller also serves an HTTPS API on port 8443, for the coming web interface and for scripts. You sign in with the router's own accounts, as for LuCI; it covers devices, adoption, configurations, and a live event stream. The web interface comes next.
 
 ## How it fits together (the design)
 
@@ -35,7 +35,7 @@ The feed has one repository per package architecture:
 
     Cargo.toml            the cargo workspace; its version is every package's
     crates/proto/         uCentral's messages, shared by agent and controller
-    crates/render/        uCentral configuration to UCI changes (wireless so far)
+    crates/render/        uCentral configuration to UCI changes (wireless and networks)
     crates/tls/           the device channel's TLS: the controller's CA, the agent's pin
     crates/ubus/          a ubus client in Rust (no libubus), for the agent
     steward-agent/        package: Makefile, Rust crate, files/ (init, UCI config)

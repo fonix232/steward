@@ -13,3 +13,4 @@
 11. [STW-12: WiFi networks and radios](012-wifi-networks-and-radios.md)
 12. [STW-15: Controller API](015-controller-api.md)
 13. [STW-11: Apply configurations](011-apply-configurations.md)
+14. [STW-13: Networks and VLANs](013-networks-and-vlans.md)

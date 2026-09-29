@@ -9,6 +9,9 @@
 //! own `wifi-device` sections, so the renderer sets options on them and lists each one in
 //! [`Plan::radio_options`], for the agent to record what it replaces.
 
+mod network;
+
+pub use network::{Network, Ports, Vlan};
 use serde_json::{Map, Value, json};
 use steward_proto::Rejection;
 
@@ -183,7 +186,7 @@ fn redacted(key: &str, value: &Value) -> Value {
 
 /// Lists `value`, sent at `path`, as not applied. It's shown redacted, so no key, password or
 /// raw line reaches the answer, whatever the caller passes.
-fn reject(plan: &mut Plan, path: &str, value: &Value, reason: impl Into<String>) {
+pub(crate) fn reject(plan: &mut Plan, path: &str, value: &Value, reason: impl Into<String>) {
     let key = path.rsplit('/').next().unwrap_or(path);
     plan.rejected.push(Rejection {
         parameter: json!({ path: redacted(key, value) }),
@@ -202,7 +205,7 @@ fn substitute(plan: &mut Plan, path: &str, value: &Value, reason: String, substi
 
 /// Rejects every key of `object`, sent at `at`, that isn't one of `handled`: dropping it
 /// silently would answer 0 for a configuration that isn't applied as sent.
-fn unsupported(plan: &mut Plan, at: &str, object: &Value, handled: &[&str]) {
+pub(crate) fn unsupported(plan: &mut Plan, at: &str, object: &Value, handled: &[&str]) {
     for (key, v) in object.as_object().into_iter().flatten() {
         if !handled.contains(&key.as_str()) {
             reject(
@@ -526,12 +529,13 @@ const SSID_KEYS: [&str; 6] = [
 /// The keys of an SSID's `encryption` that [`ssids`] handles; any other is rejected.
 const ENCRYPTION_KEYS: [&str; 3] = ["proto", "key", "ieee80211w"];
 
-/// The keys of an interface that [`ssids`] handles; any other is rejected. Networks and VLANs
-/// come with STW-13: until then every SSID runs on the device's `lan`.
-const INTERFACE_KEYS: [&str; 4] = ["name", "role", "vlan", "ssids"];
-
 /// The SSIDs: one owned `wifi-iface` per SSID per band.
-fn ssids(config: &Value, current: &Wireless, plan: &mut Plan) -> Vec<String> {
+fn ssids(
+    config: &Value,
+    current: &Wireless,
+    networks: &[Option<String>],
+    plan: &mut Plan,
+) -> Vec<String> {
     let mut wanted = Vec::new();
     let interfaces = match config.get("interfaces") {
         None => return wanted,
@@ -542,32 +546,6 @@ fn ssids(config: &Value, current: &Wireless, plan: &mut Plan) -> Vec<String> {
         }
     };
     for (i, iface) in interfaces.iter().enumerate() {
-        let at_i = format!("/interfaces/{i}");
-        if !iface.is_object() {
-            reject(plan, &at_i, iface, "an interface is an object");
-            continue;
-        }
-        unsupported(plan, &at_i, iface, &INTERFACE_KEYS);
-        if let Some(role) = iface.get("role")
-            && !matches!(role.as_str(), Some("upstream" | "downstream"))
-        {
-            reject(
-                plan,
-                &format!("{at_i}/role"),
-                role,
-                "a role is upstream or downstream",
-            );
-        }
-        // Its SSIDs would run on the device's lan, not on the network asked for.
-        if let Some(vlan) = iface.get("vlan") {
-            reject(
-                plan,
-                &format!("{at_i}/vlan"),
-                vlan,
-                "VLANs aren't supported yet: its SSIDs would run on the device's lan, so they're refused with it",
-            );
-            continue;
-        }
         let list = match iface.get("ssids") {
             None => continue,
             Some(Value::Array(a)) => a,
@@ -580,6 +558,24 @@ fn ssids(config: &Value, current: &Wireless, plan: &mut Plan) -> Vec<String> {
                 );
                 continue;
             }
+        };
+        // The interface's network; without network information, the device's LAN.
+        let network = match networks.get(i) {
+            Some(Some(n)) => n.clone(),
+            Some(None) => {
+                reject(
+                    plan,
+                    &format!("/interfaces/{i}/ssids"),
+                    &json!(
+                        list.iter()
+                            .filter_map(|s| s.get("name"))
+                            .collect::<Vec<_>>()
+                    ),
+                    "its interface's network was refused, so its SSIDs are too",
+                );
+                continue;
+            }
+            None => "lan".to_string(),
         };
         for (s, ssid) in list.iter().enumerate() {
             let at = format!("/interfaces/{i}/ssids/{s}");
@@ -754,8 +750,7 @@ fn ssids(config: &Value, current: &Wireless, plan: &mut Plan) -> Vec<String> {
                 values.insert("device".into(), json!(radio.section));
                 values.insert("mode".into(), json!("ap"));
                 values.insert("ssid".into(), json!(name));
-                // The device's LAN until networks and VLANs map interfaces (STW-13).
-                values.insert("network".into(), json!("lan"));
+                values.insert("network".into(), json!(network));
                 values.insert("encryption".into(), json!(uci_enc));
                 if let (true, Some(k)) = (needs_key, key) {
                     values.insert("key".into(), json!(k));
@@ -789,15 +784,48 @@ fn ssids(config: &Value, current: &Wireless, plan: &mut Plan) -> Vec<String> {
 /// The top-level keys this renderer handles; any other is rejected.
 const TOP_KEYS: [&str; 3] = ["uuid", "radios", "interfaces"];
 
-/// The wireless part of a configuration: radios and SSIDs.
-pub fn wireless(config: &Value, current: &Wireless) -> Plan {
-    let mut plan = Plan::default();
-    unsupported(&mut plan, "", config, &TOP_KEYS);
-    radios(config, current, &mut plan);
-    let wanted = ssids(config, current, &mut plan);
+/// Radios, SSIDs on `networks` (by interface), and the owned wireless sections no longer needed.
+/// Top-level keys it doesn't handle are rejected here, as both entry points pass through.
+fn wireless_into(config: &Value, current: &Wireless, networks: &[Option<String>], plan: &mut Plan) {
+    unsupported(plan, "", config, &TOP_KEYS);
+    radios(config, current, plan);
+    let wanted = ssids(config, current, networks, plan);
     for stale in current.owned.iter().filter(|s| !wanted.contains(s)) {
         plan.ops.push(Op::Delete {
             config: "wireless".into(),
+            section: stale.clone(),
+        });
+    }
+}
+
+/// The wireless part of a configuration: radios and SSIDs, every SSID on the device's LAN.
+pub fn wireless(config: &Value, current: &Wireless) -> Plan {
+    let mut plan = Plan::default();
+    wireless_into(config, current, &[], &mut plan);
+    plan
+}
+
+/// What the device holds now, for [`render`].
+pub struct Current<'a> {
+    pub wireless: &'a Wireless,
+    pub network: &'a Network,
+    pub ports: &'a Ports,
+}
+
+/// A whole configuration: networks and VLANs, radios, and SSIDs on their networks. The
+/// network changes come first, so a new network exists before an SSID joins it.
+pub fn render(config: &Value, current: &Current<'_>) -> Plan {
+    let mut plan = Plan::default();
+    let (networks, wanted) = network::networks(config, current.network, current.ports, &mut plan);
+    wireless_into(config, current.wireless, &networks, &mut plan);
+    for (stale, _) in current
+        .network
+        .owned
+        .iter()
+        .filter(|(s, _)| !wanted.contains(s))
+    {
+        plan.ops.push(Op::Delete {
+            config: "network".into(),
             section: stale.clone(),
         });
     }
