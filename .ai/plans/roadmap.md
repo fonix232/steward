@@ -16,8 +16,7 @@
    - Done: a new device waits as pending; adopting it (`steward-controller adopt`) hands it a credential that later connections present. The web interface will adopt through the same controller operations.
 2. **The configuration renderer.**
    - Render a subset of uCentral's schema into sections the agent owns and marks: radios and SSIDs (done, `crates/render`), VLANs, ports.
-   - Apply it through `uci::Transaction`, and confirm once the controller answers again.
-   - Persist the running uuid, and answer `configure` 0, 1 or 2 honestly.
+   - Done for wireless (STW-11): applied through `uci::Transaction`, confirmed once the controller answers again, the running uuid persisted, and `configure` answered 0, 1 or 2 honestly.
 3. **Controller storage and API**: devices, configurations and state persisted on the router. The API is done (HTTPS, sign-in through rpcd, Server-Sent Events); storing state history is STW-14.
 4. **steward-web**: devices, adoption, clients, and configuration editing.
 5. **State and topology**:

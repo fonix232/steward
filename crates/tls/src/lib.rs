@@ -18,7 +18,7 @@ use rcgen::{
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
+use rustls::pki_types::{PrivateKeyDer, UnixTime};
 use rustls::{
     ClientConfig, DigitallySignedStruct, Error as TlsError, ServerConfig, SignatureScheme,
 };
@@ -29,7 +29,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-pub use rustls::pki_types::ServerName;
+pub use rustls::pki_types::{CertificateDer, ServerName};
 pub use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 #[derive(Debug)]

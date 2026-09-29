@@ -25,7 +25,7 @@ JSON-RPC 2.0 over a WebSocket the device opens to the controller, on port 15002.
   - `1`: applied with substitutions, each listed in `rejected` as `{parameter, reason, substitution?}`.
   - `2`: not applied.
 
-  Never answer 0 for a configuration that was changed or only partly applied.
+  Never answer 0 for a configuration that was changed or only partly applied. Steward's agent answers "nothing to change" (0 or 1) only while no apply is pending on the device, since a pending one may revert what the configuration matched (busy: retried, then 2). An apply it can't confirm is rolled back before it answers 2; should that fail, rpcd reverts it when its window ends, and until then it's the pending apply that keeps the next configuration waiting.
 - **`serial`**: the device's label MAC, lower case, no separators. It's private data, so redact it in logs.
 - **`uuid`**: the configuration's number (a u64); 0 means none from a controller yet. The controller re-sends its stored configuration when a device reports another uuid.
 - **Compressed commands**: when the capabilities say `compress_cmd: true`, the controller may send `params` as `{compress_64, compress_sz}` (zlib, base64). Steward's agent doesn't advertise it.

@@ -21,8 +21,8 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    /// Opens a session that may read and change `configs`, and nothing else.
-    pub fn open(configs: &[&str]) -> Result<Transaction> {
+    /// A session of its own, granted nothing.
+    fn create() -> Result<Transaction> {
         let mut ubus = Ubus::connect()?;
         let created = ubus.call(
             "session",
@@ -34,13 +34,28 @@ impl Transaction {
             .and_then(Value::as_str)
             .ok_or(Error::Status(Status::NoData))?
             .to_owned();
+        Ok(Transaction { ubus, sid })
+    }
+
+    /// Opens a session that may read and change `configs`, and nothing else.
+    pub fn open(configs: &[&str]) -> Result<Transaction> {
         let objects: Vec<Value> = configs
             .iter()
             .flat_map(|c| [json!([c, "read"]), json!([c, "write"])])
             .collect();
-        let mut t = Transaction { ubus, sid };
+        let mut t = Transaction::create()?;
         t.session("grant", json!({ "scope": "uci", "objects": objects }))?;
         Ok(t)
+    }
+
+    /// Whether an apply with a rollback is waiting for its confirmation on the device (a LuCI
+    /// Save & Apply, another transaction's), asked without touching it. rpcd's `confirm`
+    /// (`rpc_uci_confirm` in rpcd's uci.c) answers NoData when nothing is pending, and
+    /// PermissionDenied, changing nothing, when the session asking isn't the one that
+    /// applied. It's asked from a fresh session, which has applied nothing, so it can never
+    /// confirm anything.
+    pub fn pending() -> Result<bool> {
+        pending_from(Transaction::create()?.confirm())
     }
 
     fn session(&mut self, method: &str, args: Value) -> Result<Map<String, Value>> {
@@ -79,6 +94,12 @@ impl Transaction {
             .map(drop)
     }
 
+    /// `config` as this session sees it: what's committed, with the changes staged here.
+    /// Same shape as `uci get` (`{"values": {section: {...}}}`).
+    pub fn get(&mut self, config: &str) -> Result<Map<String, Value>> {
+        self.uci("get", json!({ "config": config }))
+    }
+
     /// The staged changes, per config, as `uci changes` lists them.
     pub fn changes(&mut self) -> Result<Map<String, Value>> {
         Ok(match self.uci("changes", json!({}))?.remove("changes") {
@@ -115,9 +136,35 @@ impl Drop for Transaction {
     }
 }
 
+/// What `confirm` from a session that has applied nothing says: NoData, nothing is pending;
+/// PermissionDenied, another session's apply is.
+fn pending_from(confirm: Result<()>) -> Result<bool> {
+    match confirm {
+        Err(Error::Status(Status::NoData)) => Ok(false),
+        Err(Error::Status(Status::PermissionDenied)) => Ok(true),
+        // Only the applying session's confirm succeeds, and this one applied nothing.
+        Ok(()) => Err(Error::Status(Status::UnknownError)),
+        Err(e) => Err(e),
+    }
+}
+
 fn obj(v: Value) -> Map<String, Value> {
     match v {
         Value::Object(m) => m,
         _ => Map::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirm_from_a_session_that_applied_nothing_tells_whether_an_apply_is_pending() {
+        let status = |s| Err(Error::Status(s));
+        assert!(!pending_from(status(Status::NoData)).unwrap());
+        assert!(pending_from(status(Status::PermissionDenied)).unwrap());
+        assert!(pending_from(Ok(())).is_err());
+        assert!(pending_from(status(Status::Timeout)).is_err());
     }
 }

@@ -16,7 +16,7 @@ pub fn identity() -> Result<proto::Connect, steward_ubus::Error> {
         .unwrap_or_default();
     Ok(proto::Connect {
         serial: proto::serial(&board_json),
-        uuid: running_uuid(),
+        uuid: 0,
         firmware: board
             .get("release")
             .and_then(|r| r.get("description"))
@@ -26,12 +26,6 @@ pub fn identity() -> Result<proto::Connect, steward_ubus::Error> {
         wanip: vec![],
         capabilities: capabilities(&board, &board_json),
     })
-}
-
-/// The configuration the device runs: 0 until one from the controller is
-/// applied (applying is not implemented yet).
-pub fn running_uuid() -> u64 {
-    0
 }
 
 /// A subset of uCentral's capabilities document: what the device is and

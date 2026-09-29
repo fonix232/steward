@@ -36,6 +36,26 @@ Expect the controller to log its CA's fingerprint. The agent should log `pinned 
 
 Without `--controller`, the agent tries `wss://<default gateway>:15002`. With nothing listening there, expect `Connection refused` retries.
 
+## Applying configurations
+
+A configuration whose values match the device's current ones applies nothing, so the no-op path is safe to run any time. The agent tells by reading the staged configs back through its session (`Transaction::get`) and comparing them with what it read before, because rpcd stages a change for a list set to the value it has. Anything that changes wireless reloads the radios and drops the AP's clients for a few seconds. That's a restart of a live service: ask the user first.
+
+"Nothing to change" also needs no apply pending on the device: a LuCI Save & Apply, or the agent's own that it couldn't roll back, may revert what the configuration matched. A pending apply makes the configuration busy, retried like a refused apply. The agent asks with `Transaction::pending`: rpcd's `confirm` from a fresh session, which has applied nothing. In rpcd's `uci.c` (`rpc_uci_confirm`), confirm answers NoData (`ubus` prints "No response") when nothing is pending and PermissionDenied when another session applied, both before touching anything; only the applying session's confirm confirms. The side with nothing pending is safe to check any time, with the call itself or the CLI:
+
+    sid=$(ubus call session create '{"timeout": 30}' | jsonfilter -e '@.ubus_rpc_session')
+    ubus call uci confirm "{\"ubus_rpc_session\": \"$sid\"}"      # No response: nothing pending
+    ubus call session destroy "{\"ubus_rpc_session\": \"$sid\"}"
+
+The pending side needs an apply, which the rollback check below makes on its throwaway config.
+
+The live test (done 2026-09-29, with the user's yes):
+1. **Confirm:** add a test SSID; the agent applies and confirms, and it's on air (`iw dev`).
+2. **Rollback:** change it and kill the controller right after it sends; `running.json` records `rolled_back`. On 2026-09-29 rpcd's timer reverted it after 60 s. Since the second review the agent rolls it back itself (`uci rollback` from its session) once its tries fail, by 40 s after the apply, before it answers 2.
+3. **No loop:** restart the controller; it re-sends that uuid, and the agent refuses it.
+4. **Cleanup:** an empty configuration removes the SSID.
+
+Finish by checking that `/etc/config/wireless` equals a copy taken before (`cmp`), with nothing in `uci changes`.
+
 ## The API
 
 Run the controller with `--web-listen 127.0.0.1:8443` (loopback only) and use `curl -sk` on the device. Signing in needs an OpenWrt account whose password you know, with rpcd's access group `steward`. Don't use root's; add temporary rpcd logins and remove them afterwards (rpcd reads logins from UCI and the groups from `/usr/share/rpcd/acl.d/` on every sign-in, so nothing restarts). Take `md5sum /etc/config/rpcd` before, and compare it after:
@@ -75,8 +95,13 @@ Check these:
 - **The client against the CLI**: build the `ubus-call` example (`cargo build --release --example ubus-call` in the container above). Compare its output with `ubus call` for the same object, method and arguments, as JSON, in order: `uci get`, `network.interface dump`, `network.device status`, `luci-rpc getHostHints`. Pass JSON arguments through a script file, because ssh strips the quotes.
 - **Rollback**: `touch /etc/config/steward_test`, run the `rollback-check` example with `steward_test`, and expect:
   - an unconfirmed apply reverted within 14 s
+  - another session's apply refused while that one is pending (PermissionDenied), which the agent retries
+  - `Transaction::pending` true while it's pending, false after the revert
+  - an apply rolled back by its own session: reverted at once, nothing pending
   - a confirmed apply kept
   - `network` refused (PermissionDenied)
+  - a list set to the value it has: a change staged, but it reads back the same through the session
+  - a new value staged: the session reads it, the config doesn't
 
   Then remove `/etc/config/steward_test`. No service watches that config, so nothing restarts.
 

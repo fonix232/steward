@@ -12,11 +12,17 @@
 //! one is enabled there (the router that hosts it), and otherwise looks on the
 //! default gateway.
 //!
+//! A configuration (`configure`) is rendered, staged in an rpcd session of the
+//! agent's own and applied with rpcd's rollback (`apply`). It's confirmed only once
+//! the controller can be reached again, so one that cuts the device off undoes
+//! itself; the device then refuses that configuration until it gets another.
+//!
 //! Until the controller adopts the device, the agent has no credential and the
 //! controller sends it nothing. Adoption delivers one (`steward.adopt`), kept in
 //! `<state dir>/credential`; the agent presents it on every connection, as
 //! `Authorization: Bearer` on the WebSocket upgrade.
 
+mod apply;
 mod device;
 
 use futures_util::{SinkExt, StreamExt};
@@ -26,7 +32,7 @@ use steward_proto::{self as proto, Message, command, event};
 use steward_tls::{PinFile, PinnedCa, ServerName, TlsConnector, fingerprint};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::time::{Instant, interval, sleep, timeout, timeout_at};
+use tokio::time::{Instant, interval, sleep, sleep_until, timeout, timeout_at};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as Frame;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -39,7 +45,8 @@ macro_rules! log {
 const STATE_INTERVAL: Duration = Duration::from_secs(60);
 /// A session that stays up this long after `connect` worked: the backoff starts over.
 const ESTABLISHED: Duration = Duration::from_secs(10);
-/// How long the controller has to take a connection, TCP and the WebSocket upgrade together.
+/// How long the controller has to take a connection, TCP, TLS and the WebSocket upgrade
+/// together.
 /// One that accepts it and never answers (stopped, or not a controller) is given up on, and
 /// the backoff goes on.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -47,6 +54,18 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 /// without closing, or hangs), and the backoff takes over. The agent pings it with every
 /// state, so a controller that's there answers well within it.
 const SILENCE: Duration = Duration::from_secs(180);
+/// How long rpcd waits for the confirmation before it reverts an applied configuration.
+const ROLLBACK: Duration = Duration::from_secs(60);
+/// When to try the controller again, counted from the apply: at 5, 15 and 30 s.
+const PROBES: [u64; 3] = [5, 15, 30];
+/// How long one try may take. However slowly the tries fail, the last ends by 40 s, 20 s
+/// before rpcd reverts, which leaves the confirmation time to get through.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// While another change waits for confirmation on the device (a LuCI Save & Apply, which
+/// rpcd confirms or reverts within 90 s by default), try staging again this often...
+const BUSY_RETRY: Duration = Duration::from_secs(10);
+/// ...for this long, before answering 2.
+const BUSY_PATIENCE: Duration = Duration::from_secs(120);
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -98,6 +117,7 @@ async fn main() {
     }
     let pin = PinFile(state_dir.join("controller-ca.pem"));
     let credential = Credential(state_dir.join("credential"));
+    let state = apply::State::new(&state_dir);
 
     // Reconnect for ever, backing off to a minute. Without a controller
     // given, it is on the default gateway (the router, which usually hosts
@@ -125,8 +145,14 @@ async fn main() {
                 }
             },
         };
+        let ctx = Ctx {
+            url: &url,
+            pin: &pin,
+            credential: &credential,
+            state: &state,
+        };
         let mut connected = None;
-        match session(&url, &pin, &credential, &mut connected).await {
+        match session(&ctx, &mut connected).await {
             Ok(()) => log!("controller closed the connection"),
             Err(e) => log!("{url}: {e}"),
         }
@@ -163,27 +189,34 @@ impl Default for Backoff {
     }
 }
 
-/// Connects to the controller: TLS checked against the pinned CA (or trusted on first use and
-/// pinned), then the WebSocket, all within [`OPEN_TIMEOUT`]. `connected` is set once `connect`
-/// has gone out. A credential without a pin stops it before it connects: the credential is only
-/// for the controller the lost pin named, and without the pin any controller would be trusted
-/// and handed it.
-async fn session(
-    url: &str,
-    pin: &PinFile,
-    credential: &Credential,
-    connected: &mut Option<Instant>,
-) -> Result<(), Error> {
-    let uri: Uri = url.parse()?;
+/// What a session needs: where the controller is, and the device's own state.
+struct Ctx<'a> {
+    url: &'a str,
+    pin: &'a PinFile,
+    credential: &'a Credential,
+    state: &'a apply::State,
+}
+
+/// A stream the WebSocket runs over: TCP, or TLS on TCP.
+trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
+
+/// Opens the WebSocket to the controller, all within [`OPEN_TIMEOUT`]: TLS checked against the
+/// pinned CA (or, with no pin yet, trusted on first use: the CA to pin comes back too), the
+/// credential presented. A credential without a pin stops it before it connects: the
+/// credential is only for the controller the lost pin named, and without the pin any
+/// controller would be trusted and handed it.
+async fn open(ctx: &Ctx<'_>) -> Result<(WebSocketStream<Box<dyn Io>>, Option<Vec<u8>>), Error> {
+    let uri: Uri = ctx.url.parse()?;
     let tls = uri.scheme_str() != Some("ws");
-    let pinned = if tls { pin.load()? } else { None };
-    let mut request = url.into_client_request()?;
-    if let Some(c) = credential.load()? {
+    let pinned = if tls { ctx.pin.load()? } else { None };
+    let mut request = ctx.url.into_client_request()?;
+    if let Some(c) = ctx.credential.load()? {
         if tls && pinned.is_none() {
             return Err(format!(
                 "not connecting: this device has a credential ({}) but no pinned controller ({} is missing), and the credential is only for the controller that pin named. Restore the pin, or remove both files to move this device to another controller",
-                credential.path().display(),
-                pin.0.display()
+                ctx.credential.path().display(),
+                ctx.pin.0.display()
             )
             .into());
         }
@@ -202,38 +235,58 @@ async fn session(
     if !tls {
         let (ws, _) = timeout(OPEN_TIMEOUT, async {
             let tcp = TcpStream::connect((host.as_str(), port)).await?;
+            let tcp = Box::new(tcp) as Box<dyn Io>;
             Ok::<_, Error>(tokio_tungstenite::client_async(request, tcp).await?)
         })
         .await
         .map_err(|_| late())??;
-        return start(ws, url, credential, connected).await;
+        return Ok((ws, None));
     }
     let verifier = PinnedCa::new(pinned.clone());
     let connector = TlsConnector::from(verifier.client_config()?);
     let name = ServerName::try_from(host.clone())?;
     let (ws, _) = timeout(OPEN_TIMEOUT, async {
         let tcp = TcpStream::connect((host.as_str(), port)).await?;
-        let tls = connector.connect(name, tcp).await?;
+        let tls = Box::new(connector.connect(name, tcp).await?) as Box<dyn Io>;
         Ok::<_, Error>(tokio_tungstenite::client_async(request, tls).await?)
     })
     .await
     .map_err(|_| late())??;
-    match verifier.first_use() {
-        Some(ca) => {
-            pin.save(&ca)?;
-            log!(
-                "pinned the controller's CA {} ({})",
-                fingerprint(&ca),
-                pin.0.display()
-            );
-        }
-        None => {
-            if let Some(ca) = &pinned {
-                log!("controller's CA matches the pin {}", fingerprint(ca));
-            }
-        }
+    if let Some(ca) = &pinned {
+        log!("controller's CA matches the pin {}", fingerprint(ca));
     }
-    start(ws, url, credential, connected).await
+    Ok((ws, verifier.first_use().map(|ca| ca.as_ref().to_vec())))
+}
+
+/// Connects to the controller, pinning its CA on first use, and runs the session: the
+/// device's identity, then [`talk`]. `connected` is set once `connect` has gone out.
+async fn session(ctx: &Ctx<'_>, connected: &mut Option<Instant>) -> Result<(), Error> {
+    let (ws, first_use) = open(ctx).await?;
+    if let Some(ca) = first_use {
+        let ca = steward_tls::CertificateDer::from(ca);
+        ctx.pin.save(&ca)?;
+        log!(
+            "pinned the controller's CA {} ({})",
+            fingerprint(&ca),
+            ctx.pin.0.display()
+        );
+    }
+    let mut info = tokio::task::spawn_blocking(device::identity).await??;
+    info.uuid = ctx.state.running().uuid;
+    log!("connected to {} as {}", ctx.url, info.serial);
+    talk(ws, info, device::state, ctx, connected).await
+}
+
+/// Whether the controller can be reached right now, within `timeout`: a fresh connection,
+/// opened and closed without `connect`, so it doesn't register as the device.
+async fn reachable(ctx: &Ctx<'_>, timeout: Duration) -> bool {
+    match tokio::time::timeout(timeout, open(ctx)).await {
+        Ok(Ok((mut ws, _))) => {
+            let _ = ws.close(None).await;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// The credential the controller issued when it adopted this device.
@@ -273,18 +326,6 @@ impl Credential {
     }
 }
 
-/// A session on an open WebSocket: the device's identity, then [`talk`].
-async fn start<S: AsyncRead + AsyncWrite + Unpin>(
-    ws: WebSocketStream<S>,
-    url: &str,
-    credential: &Credential,
-    connected: &mut Option<Instant>,
-) -> Result<(), Error> {
-    let info = tokio::task::spawn_blocking(device::identity).await??;
-    log!("connected to {url} as {}", info.serial);
-    talk(ws, info, device::state, credential, connected).await
-}
-
 /// The session's messages: `connect`, then the device's `state` (read by `state`) and a ping
 /// every [`STATE_INTERVAL`], and answers to the controller's commands. It ends when the
 /// controller closes the connection, or when it has sent nothing for [`SILENCE`].
@@ -292,11 +333,10 @@ async fn talk<S: AsyncRead + AsyncWrite + Unpin>(
     mut ws: WebSocketStream<S>,
     info: proto::Connect,
     state: fn() -> Result<serde_json::Value, steward_ubus::Error>,
-    credential: &Credential,
+    ctx: &Ctx<'_>,
     connected: &mut Option<Instant>,
 ) -> Result<(), Error> {
     let serial = info.serial.clone();
-    let uuid = device::running_uuid();
     send(&mut ws, Message::notification(event::CONNECT, &info)?).await?;
     *connected = Some(Instant::now());
 
@@ -325,7 +365,7 @@ async fn talk<S: AsyncRead + AsyncWrite + Unpin>(
                 };
                 match serde_json::from_str::<Message>(&text) {
                     Ok(Message::Request { id, method, params, .. }) => {
-                        let answer = handle(&serial, &method, params, credential).await;
+                        let answer = handle(&serial, &method, params, ctx).await;
                         send(&mut ws, Message::result(id, answer)?).await?;
                     }
                     Ok(other) => log!("unexpected {other:?}"),
@@ -334,6 +374,7 @@ async fn talk<S: AsyncRead + AsyncWrite + Unpin>(
             }
             _ = tick.tick() => {
                 let state = tokio::task::spawn_blocking(state).await??;
+                let uuid = ctx.state.running().uuid;
                 let params = proto::State { serial: serial.clone(), uuid, request_uuid: None, state };
                 send(&mut ws, Message::notification(event::STATE, &params)?).await?;
                 // Answered (a pong) by a controller that's there, even with nothing to send.
@@ -357,7 +398,7 @@ async fn handle(
     serial: &str,
     method: &str,
     params: serde_json::Value,
-    credential: &Credential,
+    ctx: &Ctx<'_>,
 ) -> proto::CommandResult {
     let status = |error, text: &str| proto::CommandStatus {
         error,
@@ -371,7 +412,7 @@ async fn handle(
                 .map_err(Error::from)
                 .and_then(|a| {
                     if a.serial == serial {
-                        credential.save(&a.credential)
+                        ctx.credential.save(&a.credential)
                     } else {
                         Err(format!("a credential for {}, not this device", a.serial).into())
                     }
@@ -380,7 +421,7 @@ async fn handle(
                 Ok(()) => {
                     log!(
                         "adopted by the controller; credential saved in {}",
-                        credential.path().display()
+                        ctx.credential.path().display()
                     );
                     (0, "adopted".to_string())
                 }
@@ -397,14 +438,10 @@ async fn handle(
         }
         command::CONFIGURE => {
             let uuid = params.get("uuid").and_then(|u| u.as_u64());
-            log!("configuration {uuid:?} received; applying configurations is not implemented yet");
             proto::CommandResult {
                 serial: serial.into(),
                 uuid,
-                status: status(
-                    proto::configure_error::REJECTED,
-                    "steward-agent does not apply configurations yet",
-                ),
+                status: configure(params, ctx).await,
             }
         }
         _ => proto::CommandResult {
@@ -415,9 +452,157 @@ async fn handle(
     }
 }
 
+/// Tries `probe` (given how long it may take) at each of [`PROBES`] until one succeeds. They're
+/// counted from `applied`, so a slow try delays the next one instead of pushing the last one
+/// past rpcd's window.
+async fn tries(applied: Instant, mut probe: impl AsyncFnMut(Duration) -> bool) -> bool {
+    for at in PROBES {
+        sleep_until(applied + Duration::from_secs(at)).await;
+        if probe(PROBE_TIMEOUT).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Stages with `stage` (blocking), and again every `every` while another change waits for
+/// confirmation on the device, for up to `patience`: rpcd applies one at a time. Still
+/// [`apply::Staged::Busy`] after that.
+async fn stage_when_free<F>(
+    stage: F,
+    every: Duration,
+    patience: Duration,
+) -> Result<apply::Staged, String>
+where
+    F: Fn() -> Result<apply::Staged, String> + Clone + Send + 'static,
+{
+    let start = Instant::now();
+    loop {
+        match tokio::task::spawn_blocking(stage.clone()).await {
+            Ok(Ok(apply::Staged::Busy)) if start.elapsed() + every <= patience => {
+                log!(
+                    "another change is waiting for confirmation on the device; trying again in {every:?}"
+                );
+                sleep(every).await;
+            }
+            Ok(staged) => return staged,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// `configure`: render, stage, apply with a rollback, and confirm once the controller answers.
+async fn configure(params: serde_json::Value, ctx: &Ctx<'_>) -> proto::CommandStatus {
+    let refuse = |text: String| {
+        log!("configuration refused: {text}");
+        apply::status(vec![], false, &text)
+    };
+    let c: proto::Configure = match serde_json::from_value(params) {
+        Ok(c) => c,
+        Err(e) => return refuse(format!("unreadable configuration: {e}")),
+    };
+    let mut running = ctx.state.running();
+    if running.rolled_back == Some(c.uuid) {
+        return refuse(format!(
+            "configuration {} rolled back on this device before; send a new one",
+            c.uuid
+        ));
+    }
+    if running.uuid == c.uuid {
+        return apply::status(vec![], true, "already running");
+    }
+    let (dir, config) = (ctx.state.dir().to_owned(), c.config.clone());
+    let stage = move || apply::stage(&apply::State::new(&dir), &config, ROLLBACK);
+    let staged = match stage_when_free(stage, BUSY_RETRY, BUSY_PATIENCE).await {
+        Ok(s) => s,
+        Err(e) => return refuse(e),
+    };
+    let (plan, transaction) = match staged {
+        apply::Staged::Nothing(plan) => {
+            running.uuid = c.uuid;
+            running.rolled_back = None;
+            if let Err(e) = ctx.state.set_running(&running) {
+                return refuse(e);
+            }
+            log!("configuration {}: nothing to change", c.uuid);
+            return apply::status(plan.rejected, true, "nothing to change");
+        }
+        apply::Staged::Applied(plan, t) => (plan, t),
+        apply::Staged::Busy => {
+            return refuse(format!(
+                "another change is still waiting for confirmation on the device after {BUSY_PATIENCE:?} (LuCI's Save & Apply?): try again"
+            ));
+        }
+    };
+    log!(
+        "configuration {} applied ({} UCI operations); confirming once the controller answers",
+        c.uuid,
+        plan.ops.len()
+    );
+    let confirmed = tries(Instant::now(), async |timeout| {
+        reachable(ctx, timeout).await
+    })
+    .await;
+    let rejected = plan.rejected;
+    // Confirmed, or else reverted before the answer goes out (apply::settle).
+    let settled = tokio::task::spawn_blocking(move || {
+        let mut t = transaction;
+        let settled = apply::settle(confirmed, &mut t);
+        (settled, t)
+    })
+    .await;
+    let settled = match settled {
+        Ok(((settled, problems), t)) => {
+            for p in problems {
+                log!("configuration {}: {p}", c.uuid);
+            }
+            if settled == apply::Settled::Pending {
+                // Keep the session until the window has passed, so nothing can confirm it,
+                // then let it go.
+                tokio::spawn(async move {
+                    sleep(ROLLBACK + Duration::from_secs(5)).await;
+                    let _ = tokio::task::spawn_blocking(move || drop(t)).await;
+                });
+            }
+            settled
+        }
+        Err(e) => {
+            log!("configuration {}: {e}", c.uuid);
+            apply::Settled::Pending
+        }
+    };
+    if settled == apply::Settled::Kept {
+        running.uuid = c.uuid;
+        running.rolled_back = None;
+        if let Err(e) = ctx.state.set_running(&running) {
+            log!("{e}");
+        }
+        log!("configuration {} confirmed", c.uuid);
+        return apply::status(rejected, true, "applied");
+    }
+    running.rolled_back = Some(c.uuid);
+    if let Err(e) = ctx.state.set_running(&running) {
+        log!("{e}");
+    }
+    let why = if confirmed {
+        "confirming it failed"
+    } else {
+        "the controller was unreachable after applying it"
+    };
+    let text = match settled {
+        apply::Settled::Reverted => format!("rolled back: {why}"),
+        _ => format!("rolling back when rpcd's window ends: {why}"),
+    };
+    log!("configuration {}: {text}", c.uuid);
+    apply::status(rejected, false, &text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The next `n` waits after attempts that stayed up for `connected` after `connect`.
     fn waits(b: &mut Backoff, connected: Option<Duration>, n: usize) -> Vec<u64> {
@@ -454,9 +639,16 @@ mod tests {
         }
     }
 
-    /// No credential (a device not adopted yet).
-    fn nothing() -> Credential {
-        Credential(PathBuf::from("/nonexistent/steward-agent/credential"))
+    /// A context for a device not adopted yet, with no pin, running nothing: leaked, so a
+    /// spawned session can hold it.
+    fn ctx(url: &str) -> Ctx<'static> {
+        let dir = PathBuf::from("/nonexistent/steward-agent");
+        Ctx {
+            url: Box::leak(url.to_owned().into_boxed_str()),
+            pin: Box::leak(Box::new(PinFile(dir.join("controller-ca.pem")))),
+            credential: Box::leak(Box::new(Credential(dir.join("credential")))),
+            state: Box::leak(Box::new(apply::State::new(&dir))),
+        }
     }
 
     fn state() -> Result<serde_json::Value, steward_ubus::Error> {
@@ -490,16 +682,12 @@ mod tests {
         // TLS, the handshake (no pin here: it would be the first use).
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let pin = PinFile(PathBuf::from(
-            "/nonexistent/steward-agent/controller-ca.pem",
-        ));
-        let credential = Credential(PathBuf::from("/nonexistent/steward-agent/credential"));
         for url in [format!("ws://{addr}"), format!("wss://{addr}")] {
             let start = Instant::now();
             let mut connected = None;
             let ended = timeout(
                 Duration::from_secs(3600),
-                session(&url, &pin, &credential, &mut connected),
+                session(&ctx(&url), &mut connected),
             )
             .await;
             let err = ended.expect("still waiting after an hour").unwrap_err();
@@ -518,8 +706,8 @@ mod tests {
         let (agent, _controller) = pair().await;
         let start = Instant::now();
         let mut connected = None;
-        let credential = nothing();
-        let talking = talk(agent, identity(), state, &credential, &mut connected);
+        let ctx = ctx("ws://controller/");
+        let talking = talk(agent, identity(), state, &ctx, &mut connected);
         let ended = timeout(Duration::from_secs(24 * 3600), talking).await;
         let err = ended.expect("still talking after a day").unwrap_err();
         assert!(
@@ -533,30 +721,33 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_controller_with_nothing_to_send_keeps_the_session() {
         let (agent, mut controller) = pair().await;
-        let session = tokio::spawn(async move {
-            let mut connected = None;
-            talk(agent, identity(), state, &nothing(), &mut connected)
-                .await
-                .map_err(|e| e.to_string())
-        });
+        let ctx = ctx("ws://controller/");
+        let mut connected = None;
+        let talking = talk(agent, identity(), state, &ctx, &mut connected);
+        tokio::pin!(talking);
         // The controller only reads, which answers the agent's pings, for a day.
         let day = Instant::now() + Duration::from_secs(24 * 3600);
         let (mut states, mut pings) = (0, 0);
-        while let Ok(Some(frame)) = timeout_at(day, controller.next()).await {
-            match frame.unwrap() {
-                Frame::Text(t) if t.contains(r#""method":"state""#) => states += 1,
-                Frame::Ping(_) => pings += 1,
-                _ => {}
+        loop {
+            tokio::select! {
+                ended = &mut talking => panic!("the session ended: {:?}", ended.map_err(|e| e.to_string())),
+                frame = timeout_at(day, controller.next()) => match frame {
+                    Ok(Some(frame)) => match frame.unwrap() {
+                        Frame::Text(t) if t.contains(r#""method":"state""#) => states += 1,
+                        Frame::Ping(_) => pings += 1,
+                        _ => {}
+                    },
+                    _ => break,
+                },
             }
         }
-        assert!(!session.is_finished(), "{:?}", session.await);
         assert!(
             states >= 24 * 60 && pings >= 24 * 60,
             "{states} states, {pings} pings"
         );
         // It ends when the controller closes the connection.
         controller.close(None).await.unwrap();
-        session.await.unwrap().unwrap();
+        talking.await.unwrap();
     }
 
     /// A controller on loopback with its own CA (created in `dir`): its URL, its identity, and
@@ -604,9 +795,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let pin = PinFile(dir.join("agent/controller-ca.pem"));
         let credential = Credential(dir.join("agent/credential"));
+        let state = apply::State::new(&dir.join("agent"));
         let session = async |url: &str| {
             let mut connected = None;
-            let s = session(url, &pin, &credential, &mut connected);
+            let ctx = Ctx {
+                url,
+                pin: &pin,
+                credential: &credential,
+                state: &state,
+            };
+            let s = session(&ctx, &mut connected);
             tokio::time::timeout(Duration::from_secs(10), s)
                 .await
                 .expect("a session that doesn't end")
@@ -637,5 +835,184 @@ mod tests {
         assert_eq!(seen.await.unwrap(), Some(None));
         assert_eq!(pin.load().unwrap(), Some(other.ca));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Runs `f` with a context whose state directory is fresh (holding `running`, if given)
+    /// and whose controller is unreachable.
+    async fn with_ctx<T>(running: Option<apply::Running>, f: impl AsyncFnOnce(&Ctx<'_>) -> T) -> T {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "steward-configure-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let state = apply::State::new(&dir);
+        if let Some(r) = running {
+            state.set_running(&r).unwrap();
+        }
+        let pin = PinFile(dir.join("controller-ca.pem"));
+        let credential = Credential(dir.join("credential"));
+        let ctx = Ctx {
+            url: "wss://127.0.0.1:1",
+            pin: &pin,
+            credential: &credential,
+            state: &state,
+        };
+        let out = f(&ctx).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    fn params(uuid: u64) -> serde_json::Value {
+        json!({ "serial": "000000000000", "uuid": uuid, "config": { "uuid": uuid, "interfaces": [] } })
+    }
+
+    #[tokio::test]
+    async fn a_configuration_that_rolled_back_is_refused_until_a_new_uuid() {
+        let running = apply::Running {
+            uuid: 5,
+            rolled_back: Some(9),
+        };
+        with_ctx(Some(running.clone()), async |ctx| {
+            let s = configure(params(9), ctx).await;
+            assert_eq!(s.error, proto::configure_error::REJECTED);
+            assert!(s.text.contains("rolled back"), "{}", s.text);
+            assert_eq!(configure(params(9), ctx).await.error, 2);
+            assert_eq!(ctx.state.running(), running);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_running_uuid_is_answered_already_running() {
+        let running = apply::Running {
+            uuid: 7,
+            rolled_back: None,
+        };
+        with_ctx(Some(running), async |ctx| {
+            let s = configure(params(7), ctx).await;
+            assert_eq!(s.error, proto::configure_error::APPLIED);
+            assert_eq!(s.text, "already running");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_configuration_is_answered_2() {
+        with_ctx(None, async |ctx| {
+            let s = configure(json!({ "serial": "x", "config": {} }), ctx).await;
+            assert_eq!(s.error, proto::configure_error::REJECTED);
+            assert!(s.text.contains("unreadable"), "{}", s.text);
+            assert_eq!(ctx.state.running(), apply::Running::default());
+        })
+        .await;
+    }
+
+    /// Off a device (no ubus), staging fails at once: answered 2, running.json untouched, and
+    /// nothing recorded as rolled back.
+    #[tokio::test]
+    async fn a_failure_before_applying_is_answered_2_and_changes_nothing() {
+        if std::path::Path::new(steward_ubus::SOCKET).exists() {
+            return; // on a device, stage() would really run
+        }
+        let running = apply::Running {
+            uuid: 3,
+            rolled_back: None,
+        };
+        with_ctx(Some(running.clone()), async |ctx| {
+            let s = configure(params(4), ctx).await;
+            assert_eq!(s.error, proto::configure_error::REJECTED, "{}", s.text);
+            assert_eq!(ctx.state.running(), running);
+        })
+        .await;
+    }
+
+    /// While another change waits for confirmation (rpcd refuses the apply), staging is tried
+    /// again until it goes through, or until the patience runs out: then it's still busy, which
+    /// configure answers 2.
+    #[tokio::test]
+    async fn staging_is_tried_again_while_another_change_is_pending() {
+        let tries = Arc::new(AtomicUsize::new(0));
+        let counted = tries.clone();
+        let stage = move || {
+            if counted.fetch_add(1, Ordering::SeqCst) < 2 {
+                Ok(apply::Staged::Busy)
+            } else {
+                Ok(apply::Staged::Nothing(Default::default()))
+            }
+        };
+        let staged =
+            stage_when_free(stage, Duration::from_millis(10), Duration::from_secs(5)).await;
+        assert!(matches!(staged, Ok(apply::Staged::Nothing(_))));
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+
+        let tries = Arc::new(AtomicUsize::new(0));
+        let counted = tries.clone();
+        let busy = move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(apply::Staged::Busy)
+        };
+        let start = Instant::now();
+        let staged =
+            stage_when_free(busy, Duration::from_millis(20), Duration::from_millis(100)).await;
+        assert!(matches!(staged, Ok(apply::Staged::Busy)));
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!((3..=6).contains(&tries.load(Ordering::SeqCst)), "{tries:?}");
+
+        // Other failures aren't retried.
+        let failed = stage_when_free(
+            || Err("reading the wireless config: no".to_string()),
+            Duration::from_secs(10),
+            Duration::from_secs(120),
+        );
+        let failed = tokio::time::timeout(Duration::from_secs(1), failed).await;
+        assert!(matches!(failed, Ok(Err(_))));
+    }
+
+    /// However slowly the tries fail (each takes its whole timeout), they start at 5, 15 and
+    /// 30 s and the last ends by 40 s, well inside rpcd's window, with time left to confirm.
+    #[tokio::test(start_paused = true)]
+    async fn the_confirmation_tries_end_well_inside_the_rollback_window() {
+        let applied = Instant::now();
+        let mut started = vec![];
+        let confirmed = tries(applied, async |timeout| {
+            started.push(applied.elapsed().as_secs());
+            sleep(timeout).await;
+            false
+        })
+        .await;
+        assert!(!confirmed);
+        assert_eq!(started, [5, 15, 30]);
+        assert_eq!(applied.elapsed(), Duration::from_secs(40));
+        assert!(applied.elapsed() + Duration::from_secs(15) <= ROLLBACK);
+        // The first to succeed ends them.
+        let mut n = 0;
+        assert!(
+            tries(Instant::now(), async |_| {
+                n += 1;
+                n == 2
+            })
+            .await
+        );
+        assert_eq!(n, 2);
+    }
+
+    /// A controller that accepts the connection and never answers holds a try no longer than
+    /// its timeout.
+    #[tokio::test]
+    async fn a_silent_controller_holds_a_try_only_until_its_timeout() {
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("wss://{}", silent.local_addr().unwrap());
+        with_ctx(None, async |ctx| {
+            assert!(
+                !reachable(ctx, Duration::from_secs(1)).await,
+                "nothing on port 1"
+            );
+            let hung = Ctx { url: &url, ..*ctx };
+            let start = Instant::now();
+            assert!(!reachable(&hung, Duration::from_millis(300)).await);
+            assert!(start.elapsed() < Duration::from_secs(2));
+        })
+        .await;
     }
 }
