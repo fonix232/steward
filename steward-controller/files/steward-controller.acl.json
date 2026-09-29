@@ -1,0 +1,11 @@
+{
+	"steward": {
+		"description": "Steward: see its devices and settings (read); adopt, forget and configure devices, change settings (write)",
+		"read": {
+			"uci": [ "steward-controller" ]
+		},
+		"write": {
+			"uci": [ "steward-controller" ]
+		}
+	}
+}

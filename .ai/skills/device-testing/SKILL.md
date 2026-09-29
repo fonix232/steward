@@ -36,6 +36,40 @@ Expect the controller to log its CA's fingerprint. The agent should log `pinned 
 
 Without `--controller`, the agent tries `wss://<default gateway>:15002`. With nothing listening there, expect `Connection refused` retries.
 
+## The API
+
+Run the controller with `--web-listen 127.0.0.1:8443` (loopback only) and use `curl -sk` on the device. Signing in needs an OpenWrt account whose password you know, with rpcd's access group `steward`. Don't use root's; add temporary rpcd logins and remove them afterwards (rpcd reads logins from UCI and the groups from `/usr/share/rpcd/acl.d/` on every sign-in, so nothing restarts). Take `md5sum /etc/config/rpcd` before, and compare it after:
+
+    sec=$(uci add rpcd login); uci set rpcd.$sec.username=stwtest
+    uci set rpcd.$sec.password="$(uhttpd -m 'a-test-password')"
+    uci add_list rpcd.$sec.read='*'; uci add_list rpcd.$sec.write='*'; uci commit rpcd
+    ...
+    uci delete rpcd.$sec; uci commit rpcd
+
+Add two more the same way: one with only `read 'steward'`, and one with only a group that doesn't exist.
+
+Without the package, rpcd knows no `steward` group, so every sign-in gets 403, root's included. Put the package's ACL file in place for the test (`steward-controller/files/steward-controller.acl.json` as `/usr/share/rpcd/acl.d/steward-controller.json`) and remove it afterwards. To touch nothing outside `/tmp`, sign in through rpcd instead and grant the session what rpcd gives a login whose lists match the group, then hand its token to the API (JSON arguments in a script file on the device, as below):
+
+    ubus call session login '{"username":"stwtest","password":"a-test-password"}'
+    ubus call session grant '{"ubus_rpc_session":"<token>","scope":"access-group","objects":[["steward","read"]]}'
+
+`ubus call session access '{"ubus_rpc_session":"<token>","scope":"access-group"}'` lists a session's groups.
+
+Check these:
+- a wrong password and a missing token get 401; a login without the group gets 403, and its rpcd session is gone;
+- rpcd's unauthenticated session (`Bearer 00000000000000000000000000000000`) gets 401 on every route;
+- `/api/devices` lists the pending agent, without `credential_sha256`;
+- with `read 'steward'` only, the GETs and the event stream work, while `adopt`, `forget` and `PUT .../config` get 403, and logout works;
+- `POST .../adopt` adopts it;
+- `PUT .../config` returns a uuid, and the agent receives it;
+- `curl -N /api/events` shows `adopted`, `configuration` and `answer`;
+- after `POST /api/logout`, the token gets 401, and an open `curl -N /api/events` ends within 30 s;
+- the cookie (`-H "Cookie: steward_session=<token>"`) is set with `Path=/api`, and GETs work with it alone; a change by cookie gets 403 without `-H 'X-Steward: 1'` and works with it, while a bearer token needs no header;
+- a change with a foreign `Origin` (`https://evil.example`, or the router's own address without the port, LuCI's) or with `Sec-Fetch-Site: same-site` gets 403, whatever token it carries, and an `Origin` of `https://` and the Host curl sent works;
+- a connection that sends nothing (`nc`) is closed after 10 s, as are one that finished its TLS handshake (`openssl s_client`) without a request, and an idle one 10 s after its answer; with 40 idle ones open, a request waits until the first 32 are closed. Watch closes in `netstat -tn`: `s_client` doesn't exit when the server closes, and BusyBox `sleep` takes whole seconds;
+- run under `ulimit -n 20`, 40 idle connections make accept fail (EMFILE): `api accept` is logged once a second, not in a loop;
+- a sign-in or a `PUT .../config` whose body trickles in (a `Content-Length` larger than what's sent, through `openssl s_client`) gets 408 10 s after its headers, and a sign-in body over 4 KiB gets 413 without rpcd being asked.
+
 ## ubus and rpcd checks
 
 - **The client against the CLI**: build the `ubus-call` example (`cargo build --release --example ubus-call` in the container above). Compare its output with `ubus call` for the same object, method and arguments, as JSON, in order: `uci get`, `network.interface dump`, `network.device status`, `luci-rpc getHostHints`. Pass JSON arguments through a script file, because ssh strips the quotes.

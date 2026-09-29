@@ -18,7 +18,7 @@
    - Render a subset of uCentral's schema into sections the agent owns and marks: radios and SSIDs (done, `crates/render`), VLANs, ports.
    - Apply it through `uci::Transaction`, and confirm once the controller answers again.
    - Persist the running uuid, and answer `configure` 0, 1 or 2 honestly.
-3. **Controller storage and API**: devices, configurations and state persisted on the router. A REST and WebSocket API for the interface.
+3. **Controller storage and API**: devices, configurations and state persisted on the router. The API is done (HTTPS, sign-in through rpcd, Server-Sent Events); storing state history is STW-14.
 4. **steward-web**: devices, adoption, clients, and configuration editing.
 5. **State and topology**:
    - clients (hostapd over ubus)

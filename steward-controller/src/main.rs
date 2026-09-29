@@ -7,28 +7,37 @@
 //! certificate in `<state dir>/tls/`, and agents pin that CA (`steward_tls`).
 //!
 //! A device is managed only once it's adopted (`devices`): until then it stays
-//! pending, connected but sent nothing. Adoption goes through the control socket
-//! (`control`): `steward-controller adopt <serial>`. An adopted device's
-//! configuration lives in `<config dir>/<serial>.json`, a uCentral configuration
-//! whose `uuid` numbers it; a device reporting another uuid is sent it.
+//! pending, connected but sent nothing. Adopting, forgetting and configuring
+//! devices are operations of the `hub`, which the control socket (`control`:
+//! `steward-controller adopt <serial>`) and the HTTPS API (`api`, port 8443)
+//! both call. An adopted device's configuration lives in
+//! `<config dir>/<serial>.json`, a uCentral configuration whose `uuid` numbers
+//! it; a device reporting another uuid is sent it.
 
+macro_rules! log {
+    ($($t:tt)*) => { eprintln!("steward-controller: {}", format_args!($($t)*)) };
+}
+pub(crate) use log;
+
+mod api;
 mod control;
 mod devices;
+mod hub;
 
 use control::{Answer, Request};
 use devices::{Admission, Devices};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::Value;
-use std::collections::HashMap;
+use hub::{Device, Hub, Outgoing};
+use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use steward_proto::{self as proto, Message, Outcome, command, event};
+use steward_proto::{self as proto, Message, Outcome, event};
 use steward_tls::{ControllerIdentity, TlsAcceptor, fingerprint};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 use tokio_tungstenite::tungstenite::Message as Frame;
 use tokio_tungstenite::tungstenite::handshake::server::{
@@ -64,16 +73,18 @@ const LOG_TEXT: usize = 128;
 /// Why a pending device is disconnected when newer ones take its place.
 const TOO_MANY_PENDING: &str = "too many devices waiting for adoption";
 
-const USAGE: &str = "usage: steward-controller [--listen <address:port>] [--state-dir <dir>] [--config-dir <dir>] [--control <socket>] [--plaintext] [--adopt-local]
+const USAGE: &str = "usage: steward-controller [--listen <address:port>] [--web-listen <address:port>] [--state-dir <dir>] [--config-dir <dir>] [--control <socket>] [--plaintext] [--adopt-local]
        steward-controller [--control <socket>] devices | adopt <serial> | forget <serial>";
 
 struct Args {
     listen: String,
+    /// The HTTPS API (and later the web interface); empty: none.
+    web_listen: String,
     state_dir: PathBuf,
     config_dir: Option<PathBuf>,
     /// The control socket (in /var/run: not on flash).
     control: PathBuf,
-    /// Serve plain ws:// (development only).
+    /// Serve plain ws:// and http:// (development only).
     plaintext: bool,
     /// Adopt devices connecting over loopback: the controller's own host (the init script).
     adopt_local: bool,
@@ -85,6 +96,7 @@ impl Args {
     fn parse() -> Args {
         let mut a = Args {
             listen: format!("[::]:{}", proto::PORT),
+            web_listen: "[::]:8443".into(),
             state_dir: PathBuf::from("/etc/steward"),
             config_dir: None,
             control: PathBuf::from("/var/run/steward-controller.sock"),
@@ -104,6 +116,7 @@ impl Args {
                     std::process::exit(0);
                 }
                 "--listen" => a.listen = it.next().unwrap_or_else(|| usage()),
+                "--web-listen" => a.web_listen = it.next().unwrap_or_else(|| usage()),
                 "--state-dir" => a.state_dir = it.next().unwrap_or_else(|| usage()).into(),
                 "--config-dir" => a.config_dir = Some(it.next().unwrap_or_else(|| usage()).into()),
                 "--control" => a.control = it.next().unwrap_or_else(|| usage()).into(),
@@ -127,30 +140,10 @@ impl Args {
     }
 }
 
-/// Where a connected device's messages go.
-enum Outgoing {
-    Send(Message),
-    Close(&'static str),
+fn fail(e: impl std::fmt::Display) -> ! {
+    log!("{e}");
+    std::process::exit(1);
 }
-
-/// A connected device.
-struct Device {
-    addr: SocketAddr,
-    uuid: u64,
-    state: Option<Value>,
-    /// Commands to send it.
-    tx: mpsc::Sender<Outgoing>,
-    /// The id of the `steward.adopt` command awaiting its answer.
-    adopt_id: Option<u64>,
-}
-
-struct Registry {
-    connected: HashMap<String, Device>,
-    devices: Devices,
-    next_id: u64,
-}
-
-type Shared = Arc<Mutex<Registry>>;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -158,51 +151,30 @@ async fn main() {
     if let Some(req) = args.command {
         std::process::exit(control::client(&args.control, req));
     }
-    let listener = match TcpListener::bind(&args.listen).await {
-        Ok(l) => l,
-        Err(e) => {
-            log!("cannot listen on {}: {e}", args.listen);
-            std::process::exit(1);
-        }
-    };
-    let acceptor = if args.plaintext {
-        log!("serving plain ws:// (--plaintext): development only");
-        None
+    let listener = TcpListener::bind(&args.listen)
+        .await
+        .unwrap_or_else(|e| fail(format!("cannot listen on {}: {e}", args.listen)));
+    let (acceptor, web_acceptor) = if args.plaintext {
+        log!("serving plain ws:// and http:// (--plaintext): development only");
+        (None, None)
     } else {
-        match tls(&args.state_dir.join("tls")) {
-            Ok(a) => Some(a),
-            Err(e) => {
-                log!("{e}");
-                std::process::exit(1);
-            }
-        }
+        let (devices, web) = tls(&args.state_dir.join("tls")).unwrap_or_else(|e| fail(e));
+        (Some(devices), Some(web))
     };
-    let devices = match Devices::load(&args.state_dir.join("devices.json")) {
-        Ok(d) => d,
-        Err(e) => {
-            log!("{e}");
-            std::process::exit(1);
-        }
-    };
-    let registry: Shared = Arc::new(Mutex::new(Registry {
-        connected: HashMap::new(),
-        devices,
-        next_id: 0,
-    }));
-    let config_dir = Arc::new(
-        args.config_dir
-            .unwrap_or_else(|| args.state_dir.join("configs")),
-    );
+    let devices = Devices::load(&args.state_dir.join("devices.json")).unwrap_or_else(|e| fail(e));
+    let config_dir = args
+        .config_dir
+        .clone()
+        .unwrap_or_else(|| args.state_dir.join("configs"));
+    let hub = Arc::new(Hub::new(devices, config_dir));
 
-    let socket = args.control.clone();
-    let (reg, cfg) = (registry.clone(), config_dir.clone());
+    let (socket, h) = (args.control.clone(), hub.clone());
     tokio::spawn(async move {
-        let path = socket.clone();
         let handler = move |req| {
-            let (reg, cfg) = (reg.clone(), cfg.clone());
-            async move { control_request(req, &reg, &cfg).await }
+            let h = h.clone();
+            async move { control_request(req, &h).await }
         };
-        if let Err(e) = control::serve(&path, handler).await {
+        if let Err(e) = control::serve(&socket, handler).await {
             log!("control socket {}: {e}", socket.display());
         }
     });
@@ -219,6 +191,19 @@ async fn main() {
     } else {
         None
     };
+    if !args.web_listen.is_empty() {
+        let web = TcpListener::bind(&args.web_listen)
+            .await
+            .unwrap_or_else(|e| fail(format!("cannot listen on {}: {e}", args.web_listen)));
+        let scheme = if web_acceptor.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        log!("serving the API on {scheme}://{}", args.web_listen);
+        let app = api::router(hub.clone(), Arc::new(api::Rpcd));
+        tokio::spawn(api::serve(web, web_acceptor, app));
+    }
 
     let scheme = if acceptor.is_some() { "wss" } else { "ws" };
     log!("listening for devices on {scheme}://{}", args.listen);
@@ -232,20 +217,10 @@ async fn main() {
             .expect("never closed");
         match listener.accept().await {
             Ok((tcp, addr)) => {
-                let (registry, config_dir, acceptor) =
-                    (registry.clone(), config_dir.clone(), acceptor.clone());
+                let (hub, acceptor) = (hub.clone(), acceptor.clone());
                 let adopt_local = adopt_local.clone();
                 tokio::spawn(async move {
-                    let result = connection(
-                        tcp,
-                        addr,
-                        acceptor,
-                        registry,
-                        config_dir,
-                        adopt_local,
-                        handshake,
-                    )
-                    .await;
+                    let result = connection(tcp, addr, acceptor, hub, adopt_local, handshake).await;
                     if let Err(e) = result {
                         // It can quote the device (serde's errors do).
                         log!("{addr}: {}", clip(&e.to_string()));
@@ -262,8 +237,9 @@ async fn main() {
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
-/// The device channel's TLS: the controller's identity, created on first start.
-fn tls(dir: &Path) -> Result<TlsAcceptor, Error> {
+/// The controller's TLS, from its identity (created on first start): the device channel's,
+/// and the API's (the same certificate, speaking HTTP/1.1).
+fn tls(dir: &Path) -> Result<(TlsAcceptor, TlsAcceptor), Error> {
     let id = ControllerIdentity::load_or_create(dir)?;
     log!(
         "{} the controller's CA in {}: {}",
@@ -271,7 +247,12 @@ fn tls(dir: &Path) -> Result<TlsAcceptor, Error> {
         dir.display(),
         fingerprint(&id.ca)
     );
-    Ok(TlsAcceptor::from(id.server_config()?))
+    let mut web = (*id.server_config()?).clone();
+    web.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok((
+        TlsAcceptor::from(id.server_config()?),
+        TlsAcceptor::from(Arc::new(web)),
+    ))
 }
 
 /// A new connection on the device port: the TLS handshake (none with `--plaintext`), within
@@ -280,16 +261,15 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     addr: SocketAddr,
     acceptor: Option<TlsAcceptor>,
-    registry: Shared,
-    config_dir: Arc<PathBuf>,
+    hub: Arc<Hub>,
     adopt_local: Option<Arc<str>>,
     handshake: OwnedSemaphorePermit,
 ) -> Result<(), Error> {
     let Some(acceptor) = acceptor else {
-        return serve(stream, addr, registry, config_dir, adopt_local, handshake).await;
+        return serve(stream, addr, hub, adopt_local, handshake).await;
     };
     match timeout(TLS_TIMEOUT, acceptor.accept(stream)).await {
-        Ok(Ok(tls)) => serve(tls, addr, registry, config_dir, adopt_local, handshake).await,
+        Ok(Ok(tls)) => serve(tls, addr, hub, adopt_local, handshake).await,
         Ok(Err(e)) => Err(format!("TLS handshake: {e}").into()),
         Err(_) => Err("no TLS handshake in time".into()),
     }
@@ -305,8 +285,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
 async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     addr: SocketAddr,
-    registry: Shared,
-    config_dir: Arc<PathBuf>,
+    hub: Arc<Hub>,
     adopt_local: Option<Arc<str>>,
     handshake: OwnedSemaphorePermit,
 ) -> Result<(), Error> {
@@ -365,7 +344,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     // oldest) disconnected: records and connections go together, so connections that aren't
     // adopted stay bounded too.
     let admission = {
-        let mut guard = registry.lock().await;
+        let mut guard = hub.registry.lock().await;
         let reg = &mut *guard;
         let connected = &reg.connected;
         let mut admission = reg.devices.admit(
@@ -428,6 +407,11 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             .await;
         return Ok(());
     }
+    hub.emit(
+        "connected",
+        &serial,
+        json!({ "address": addr.to_string(), "firmware": clip(&connect.firmware), "running": connect.uuid }),
+    );
     match admission {
         Admission::Pending => log!(
             "{serial} connected from {addr}: {}; pending adoption (steward-controller adopt {serial})",
@@ -438,7 +422,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 "{serial} connected from {addr}: {}; adopted, sending its credential",
                 clip(&connect.firmware)
             );
-            send_credential(&serial, credential, &registry).await;
+            hub.send_credential(&serial, credential).await;
         }
         Admission::Admitted => {
             log!(
@@ -446,7 +430,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 clip(&connect.firmware),
                 connect.uuid
             );
-            provision(&serial, &registry, &config_dir).await;
+            hub.provision(&serial).await;
         }
         Admission::Refused => unreachable!(),
     }
@@ -457,7 +441,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             m = timeout_at(heard + SILENCE, next_message(&mut ws)) => match m {
                 Ok(Ok(Some(m))) => {
                     heard = Instant::now();
-                    handle(&serial, m, &registry, &config_dir).await
+                    handle(&serial, m, &hub).await
                 }
                 Ok(Ok(None)) => break Ok(()),
                 Ok(Err(e)) => break Err(e),
@@ -480,9 +464,11 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     };
-    let mut reg = registry.lock().await;
+    let mut reg = hub.registry.lock().await;
     if reg.connected.get(&serial).is_some_and(|d| d.addr == addr) {
         reg.connected.remove(&serial);
+        drop(reg);
+        hub.emit("disconnected", &serial, Value::Null);
     }
     log!("{serial} disconnected");
     result
@@ -512,36 +498,12 @@ async fn next_message<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(None)
 }
 
-/// Sends a connected device its credential (`steward.adopt`); its answer completes the adoption.
-async fn send_credential(serial: &str, credential: String, registry: &Shared) {
-    let mut reg = registry.lock().await;
-    reg.next_id += 1;
-    let id = reg.next_id;
-    let Some(d) = reg.connected.get_mut(serial) else {
-        return;
-    };
-    match Message::request(
-        id,
-        command::ADOPT,
-        &proto::Adopt {
-            serial: serial.into(),
-            credential,
-        },
-    ) {
-        Ok(m) => {
-            d.adopt_id = Some(id);
-            let _ = d.tx.try_send(Outgoing::Send(m));
-        }
-        Err(e) => log!("{serial}: {e}"),
-    }
-}
-
-async fn handle(serial: &str, m: Message, registry: &Shared, config_dir: &Path) {
+async fn handle(serial: &str, m: Message, hub: &Hub) {
     match m {
         Message::Notification { method, params, .. } => match method.as_str() {
             event::STATE => {
                 let uuid = params.get("uuid").and_then(Value::as_u64);
-                let mut reg = registry.lock().await;
+                let mut reg = hub.registry.lock().await;
                 let adopted = reg.devices.is_adopted(serial);
                 if let Some(d) = reg.connected.get_mut(serial) {
                     d.state = params.get("state").cloned();
@@ -555,11 +517,13 @@ async fn handle(serial: &str, m: Message, registry: &Shared, config_dir: &Path) 
                     log!(
                         "{serial}: state (configuration {}, load {})",
                         d.uuid,
-                        clip(&load.unwrap_or_default().to_string())
+                        clip(&load.clone().unwrap_or_default().to_string())
                     );
+                    let state = d.state.clone().unwrap_or(Value::Null);
                     drop(reg);
+                    hub.emit("state", serial, state);
                     if stale && adopted {
-                        provision(serial, registry, config_dir).await;
+                        hub.provision(serial).await;
                     }
                 }
             }
@@ -577,7 +541,7 @@ async fn handle(serial: &str, m: Message, registry: &Shared, config_dir: &Path) 
                 }
                 Outcome::Error(_) => None,
             };
-            let mut reg = registry.lock().await;
+            let mut reg = hub.registry.lock().await;
             let is_adoption = reg.connected.get(serial).and_then(|d| d.adopt_id) == Some(id);
             if is_adoption {
                 let mut over_loopback = false;
@@ -591,7 +555,8 @@ async fn handle(serial: &str, m: Message, registry: &Shared, config_dir: &Path) 
                         Err(e) => log!("{serial}: {e}"),
                     }
                     drop(reg);
-                    provision(serial, registry, config_dir).await;
+                    hub.emit("adopted", serial, Value::Null);
+                    hub.provision(serial).await;
                 } else {
                     log!(
                         "{serial}: didn't take its credential: {}",
@@ -600,7 +565,8 @@ async fn handle(serial: &str, m: Message, registry: &Shared, config_dir: &Path) 
                 }
                 return;
             }
-            match (result, outcome) {
+            drop(reg);
+            match (&result, &outcome) {
                 (Some(r), _) => log!(
                     "{serial}: command {id}: {} {}",
                     r.status.error,
@@ -615,6 +581,11 @@ async fn handle(serial: &str, m: Message, registry: &Shared, config_dir: &Path) 
                     log!("{serial}: command {id}: {}", clip(&r.to_string()))
                 }
             }
+            hub.emit(
+                "answer",
+                serial,
+                json!({ "id": id, "result": result.map(|r| json!(r.status)) }),
+            );
         }
         Message::Request { method, .. } => {
             log!("{serial}: unexpected request {}", clip(&method))
@@ -635,92 +606,20 @@ fn clip(text: &str) -> String {
     format!("{}… ({} bytes)", &text[..end], text.len())
 }
 
-/// Sends an adopted device its stored configuration, if it runs another.
-async fn provision(serial: &str, registry: &Shared, config_dir: &Path) {
-    let path = config_dir.join(format!("{serial}.json"));
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return;
+/// A request on the control socket: the hub's operations.
+async fn control_request(req: Request, hub: &Hub) -> Answer {
+    let answer = |r: Result<String, hub::OpError>| match r {
+        Ok(m) => Answer::ok(m),
+        Err(e) => Answer::error(e.to_string()),
     };
-    let config: Value = match serde_json::from_str(&text) {
-        Ok(c) => c,
-        Err(e) => {
-            log!("{}: {e}", path.display());
-            return;
-        }
-    };
-    let Some(uuid) = config.get("uuid").and_then(Value::as_u64) else {
-        log!("{}: no uuid", path.display());
-        return;
-    };
-    let mut reg = registry.lock().await;
-    if !reg.devices.is_adopted(serial) {
-        return;
-    }
-    reg.next_id += 1;
-    let id = reg.next_id;
-    let Some(d) = reg.connected.get(serial) else {
-        return;
-    };
-    if d.uuid == uuid {
-        return;
-    }
-    let params = proto::Configure {
-        serial: serial.into(),
-        uuid,
-        when: 0,
-        config,
-    };
-    match Message::request(id, command::CONFIGURE, &params) {
-        Ok(m) => {
-            log!("{serial}: sending configuration {uuid} (command {id})");
-            let _ = d.tx.try_send(Outgoing::Send(m));
-        }
-        Err(e) => log!("{serial}: {e}"),
-    }
-}
-
-/// A request on the control socket.
-async fn control_request(req: Request, registry: &Shared, _config_dir: &Path) -> Answer {
-    let mut reg = registry.lock().await;
     match req {
-        Request::Devices => {
-            let connected: Vec<String> = reg.connected.keys().cloned().collect();
-            let devices =
-                control::devices_json(reg.devices.all(), |s| connected.iter().any(|c| c == s));
-            Answer {
-                ok: true,
-                message: String::new(),
-                devices,
-            }
-        }
-        Request::Adopt { serial } => {
-            if let Err(e) = reg.devices.adopt(&serial) {
-                return Answer::error(e.to_string());
-            }
-            if !reg.connected.contains_key(&serial) {
-                return Answer::ok(format!("{serial} will be adopted when it next connects"));
-            }
-            match reg.devices.issue(&serial) {
-                Ok(Some(credential)) => {
-                    drop(reg);
-                    send_credential(&serial, credential, registry).await;
-                    Answer::ok(format!("adopting {serial}: its credential is on the way"))
-                }
-                Ok(None) => Answer::error(format!("{serial} can't be adopted now")),
-                Err(e) => Answer::error(e.to_string()),
-            }
-        }
-        Request::Forget { serial } => match reg.devices.forget(&serial) {
-            Ok(true) => {
-                if let Some(d) = reg.connected.get(&serial) {
-                    let _ =
-                        d.tx.try_send(Outgoing::Close("forgotten by the controller"));
-                }
-                Answer::ok(format!("forgot {serial}; its credential no longer works"))
-            }
-            Ok(false) => Answer::error(format!("no device {serial}")),
-            Err(e) => Answer::error(e.to_string()),
+        Request::Devices => Answer {
+            ok: true,
+            message: String::new(),
+            devices: hub.devices().await,
         },
+        Request::Adopt { serial } => answer(hub.adopt(&serial).await),
+        Request::Forget { serial } => answer(hub.forget(&serial).await),
     }
 }
 
@@ -728,42 +627,37 @@ async fn control_request(req: Request, registry: &Shared, _config_dir: &Path) ->
 mod tests {
     use super::*;
     use serde_json::json;
+    use steward_proto::command;
     use steward_tls::{PinnedCa, ServerName, TlsConnector};
     use tokio::io::DuplexStream;
     use tokio::task::JoinHandle;
     use tokio::time::Instant;
     use tokio_tungstenite::WebSocketStream;
 
-    /// A registry on a state directory of its own.
-    fn registry(name: &str) -> (PathBuf, Shared) {
+    /// A hub on a state directory of its own, its configurations in `configs/`.
+    fn registry(name: &str) -> (PathBuf, Arc<Hub>) {
         let dir = std::env::temp_dir().join(format!("steward-conn-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let devices = Devices::load(&dir.join("devices.json")).unwrap();
-        let registry = Registry {
-            connected: HashMap::new(),
-            devices,
-            next_id: 0,
-        };
-        (dir, Arc::new(Mutex::new(registry)))
+        let hub = Hub::new(devices, dir.join("configs"));
+        (dir, Arc::new(hub))
     }
 
     /// A connection from a device, over TLS with `acceptor` or plain, holding one of `slots`:
     /// the device's end.
     fn open(
-        registry: &Shared,
+        registry: &Arc<Hub>,
         slots: &Arc<Semaphore>,
         acceptor: Option<TlsAcceptor>,
     ) -> (DuplexStream, JoinHandle<Result<(), String>>) {
         let (device, controller) = tokio::io::duplex(1 << 16);
         let handshake = slots.clone().try_acquire_owned().unwrap();
-        let (registry, config_dir) = (registry.clone(), Arc::new(PathBuf::from("/nonexistent")));
+        let registry = registry.clone();
         let task = tokio::spawn(async move {
             let addr = "192.0.2.10:40000".parse().unwrap();
-            connection(
-                controller, addr, acceptor, registry, config_dir, None, handshake,
-            )
-            .await
-            .map_err(|e| e.to_string())
+            connection(controller, addr, acceptor, registry, None, handshake)
+                .await
+                .map_err(|e| e.to_string())
         });
         (device, task)
     }
@@ -847,7 +741,7 @@ mod tests {
         ends_after(task, CONNECT_TIMEOUT, "no connect in time").await;
         assert_eq!(slots.available_permits(), 1);
         assert!(matches!(ws.next().await, None | Some(Err(_))), "closed");
-        assert!(registry.lock().await.connected.is_empty());
+        assert!(registry.registry.lock().await.connected.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -862,10 +756,17 @@ mod tests {
         // Well past both time limits, it's still there.
         sleep(UPGRADE_TIMEOUT + CONNECT_TIMEOUT + Duration::from_secs(60)).await;
         assert!(!task.is_finished());
-        assert!(registry.lock().await.connected.contains_key("00005e005301"));
+        assert!(
+            registry
+                .registry
+                .lock()
+                .await
+                .connected
+                .contains_key("00005e005301")
+        );
         ws.close(None).await.unwrap();
         task.await.unwrap().unwrap();
-        assert!(registry.lock().await.connected.is_empty());
+        assert!(registry.registry.lock().await.connected.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -883,7 +784,14 @@ mod tests {
         let big = "f".repeat(MAX_MESSAGE - 1000);
         send(&mut ws, event::CONNECT, connect_as("00005e005301", big)).await;
         sleep(Duration::from_millis(1)).await;
-        assert!(registry.lock().await.connected.contains_key("00005e005301"));
+        assert!(
+            registry
+                .registry
+                .lock()
+                .await
+                .connected
+                .contains_key("00005e005301")
+        );
         ws.close(None).await.unwrap();
         task.await.unwrap().unwrap();
 
@@ -897,7 +805,7 @@ mod tests {
         assert!(sent.await.is_err(), "the whole message was taken");
         let err = task.await.unwrap().unwrap_err();
         assert!(err.contains("Message too long"), "{err}");
-        assert!(registry.lock().await.connected.is_empty());
+        assert!(registry.registry.lock().await.connected.is_empty());
         assert_eq!(slots.available_permits(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -916,7 +824,7 @@ mod tests {
         .await;
         let err = task.await.unwrap().unwrap_err();
         assert!(err.contains("a serial of 129 bytes"), "{err}");
-        assert!(registry.lock().await.connected.is_empty());
+        assert!(registry.registry.lock().await.connected.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -940,7 +848,7 @@ mod tests {
         }
         // Then nothing, with the connection still open (gone without closing): dropped.
         ends_after(task, SILENCE, "nothing from 00005e005301 for 180 s").await;
-        assert!(registry.lock().await.connected.is_empty());
+        assert!(registry.registry.lock().await.connected.is_empty());
         assert!(matches!(ws.next().await, None | Some(Err(_))), "closed");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -974,7 +882,14 @@ mod tests {
         send(&mut ws, event::CONNECT, hello()).await;
         sleep(Duration::from_millis(1)).await;
         assert_eq!(slots.available_permits(), 1);
-        assert!(registry.lock().await.connected.contains_key("00005e005301"));
+        assert!(
+            registry
+                .registry
+                .lock()
+                .await
+                .connected
+                .contains_key("00005e005301")
+        );
         ws.close(None).await.unwrap();
         task.await.unwrap().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
@@ -982,7 +897,7 @@ mod tests {
 
     /// A device connected as `serial`, with no credential: pending.
     async fn pending(
-        registry: &Shared,
+        registry: &Arc<Hub>,
         slots: &Arc<Semaphore>,
         serial: &str,
     ) -> (
@@ -1023,7 +938,7 @@ mod tests {
         task.await.unwrap().unwrap();
         held.push_back(newest);
         {
-            let reg = registry.lock().await;
+            let reg = registry.registry.lock().await;
             assert_eq!(reg.connected.len(), MAX_PENDING);
             assert!(!reg.devices.all().contains_key(&serial(0)));
             assert!(
@@ -1034,7 +949,7 @@ mod tests {
         }
         // A connected device is listed, so it can be adopted: its credential goes out.
         let adopt = Request::Adopt { serial: serial(1) };
-        let answer = control_request(adopt, &registry, &dir).await;
+        let answer = control_request(adopt, &registry).await;
         assert!(answer.ok, "{}", answer.message);
         match timeout(Duration::from_secs(1), held[0].0.next()).await {
             Ok(Some(Ok(Frame::Text(t)))) => assert!(t.contains(command::ADOPT), "{t}"),
@@ -1043,7 +958,7 @@ mod tests {
         // The dropped device is pending again when it reconnects. (The adopted one made room.)
         held.push_back(pending(&registry, &slots, &serial(0)).await);
         {
-            let reg = registry.lock().await;
+            let reg = registry.registry.lock().await;
             assert_eq!(reg.devices.all()[&serial(0)].standing, Standing::Pending);
             assert!(reg.connected.contains_key(&serial(0)));
             assert_eq!(reg.connected.len(), MAX_PENDING + 1);
@@ -1066,7 +981,7 @@ mod tests {
             task.await.unwrap().unwrap();
         }
         {
-            let reg = registry.lock().await;
+            let reg = registry.registry.lock().await;
             assert!(reg.connected.contains_key("00005e005301"));
             let pending = reg.devices.all().len();
             assert_eq!(pending, devices::MAX_PENDING);
@@ -1081,7 +996,7 @@ mod tests {
         let adopt = Request::Adopt {
             serial: "00005e005301".into(),
         };
-        let answer = control_request(adopt, &registry, &dir).await;
+        let answer = control_request(adopt, &registry).await;
         assert!(answer.ok, "{}", answer.message);
         there.close(None).await.unwrap();
         task.await.unwrap().unwrap();
@@ -1115,7 +1030,7 @@ mod tests {
     /// A device connecting from `addr` as `serial`, presenting `credential`, to a controller
     /// whose own host is `own` (`--adopt-local`): its WebSocket, once `connect` is sent.
     async fn device(
-        registry: &Shared,
+        registry: &Arc<Hub>,
         config_dir: &Path,
         addr: &str,
         own: Option<&str>,
@@ -1125,10 +1040,11 @@ mod tests {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let (device, controller) = tokio::io::duplex(1 << 16);
         let handshake = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-        let (registry, config_dir) = (registry.clone(), Arc::new(config_dir.to_owned()));
+        assert_eq!(config_dir, registry.config_dir, "the hub's configurations");
+        let registry = registry.clone();
         let (addr, own) = (addr.parse().unwrap(), own.map(Arc::from));
         let task = tokio::spawn(async move {
-            serve(controller, addr, registry, config_dir, own, handshake)
+            serve(controller, addr, registry, own, handshake)
                 .await
                 .map_err(|e| e.to_string())
         });
@@ -1237,7 +1153,7 @@ mod tests {
         assert_eq!(next(&mut d.0).await, Got::Nothing);
         hang_up(d).await;
         {
-            let reg = registry.lock().await;
+            let reg = registry.registry.lock().await;
             assert!(reg.devices.is_adopted(HOST));
             assert!(reg.devices.all()[HOST].adopted_over_loopback);
             assert_eq!(reg.devices.all()[AP].standing, devices::Standing::Pending);
@@ -1273,7 +1189,7 @@ mod tests {
         // An access point connects from the network, and is adopted and provisioned.
         let mut ap = device(&registry, &cfg, REMOTE, Some(HOST), None, AP).await;
         assert_eq!(next(&mut ap.0).await, Got::Nothing);
-        control_request(Request::Adopt { serial: AP.into() }, &registry, &cfg).await;
+        control_request(Request::Adopt { serial: AP.into() }, &registry).await;
         let credential = take_credential(&mut ap.0, AP).await;
         let Got::Command(id, method, params) = next(&mut ap.0).await else {
             panic!("no configuration")

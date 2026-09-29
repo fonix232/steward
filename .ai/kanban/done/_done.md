@@ -11,3 +11,4 @@
 9. [STW-10: Adopt devices](010-adopt-devices.md)
 10. [STW-20: Controller on the router](020-controller-on-the-router.md)
 11. [STW-12: WiFi networks and radios](012-wifi-networks-and-radios.md)
+12. [STW-15: Controller API](015-controller-api.md)

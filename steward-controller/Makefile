@@ -31,6 +31,8 @@ define Package/steward-controller/description
   configuration, and collects their state, clients, traffic and topology.
   Devices connect to it on port 15002 (uCentral's WebSocket protocol); the
   web interface is steward-web. Settings: /etc/config/steward-controller.
+  Its API signs in the router's accounts through rpcd; an account needs the
+  access group steward, which root's has.
 endef
 
 define Package/steward-controller/conffiles
@@ -47,6 +49,8 @@ define Package/steward-controller/install
 	$(INSTALL_CONF) ./files/steward-controller.config $(1)/etc/config/steward-controller
 	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
 	$(INSTALL_DATA) ./files/steward-controller.keep $(1)/lib/upgrade/keep.d/steward-controller
+	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
+	$(INSTALL_DATA) ./files/steward-controller.acl.json $(1)/usr/share/rpcd/acl.d/steward-controller.json
 endef
 
 $(eval $(call RustBinPackage,steward-controller))

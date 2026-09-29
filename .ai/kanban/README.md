@@ -6,10 +6,10 @@ The project's tasks, one Markdown card each, kept with [kanban](https://github.c
 | --- | --- |
 | [Backlog](backlog/_backlog.md) | 35 |
 | [Next](next/_next.md) | 4 |
-| [Ready to start](todo/_todo.md) | 6 |
+| [Ready to start](todo/_todo.md) | 5 |
 | [In progress](doing/_doing.md) | 0 |
 | [In review](review/_review.md) | 1 |
-| [Done](done/_done.md) | 11 |
+| [Done](done/_done.md) | 12 |
 
 ## In review
 
@@ -17,7 +17,6 @@ The project's tasks, one Markdown card each, kept with [kanban](https://github.c
 
 ## Ready to start
 
-- [STW-15](todo/015-controller-api.md): Controller API
 - [STW-11](todo/011-apply-configurations.md): Apply configurations
 - [STW-13](todo/013-networks-and-vlans.md): Networks and VLANs
 - [STW-14](todo/014-controller-storage.md): Controller storage

@@ -4,7 +4,7 @@
 //! operations through its API.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -135,21 +135,4 @@ pub fn client(socket: &Path, req: Request) -> i32 {
         println!("{}", answer.message);
     }
     if answer.ok { 0 } else { 1 }
-}
-
-/// The device list as the socket returns it.
-pub fn devices_json(
-    records: &std::collections::BTreeMap<String, crate::devices::Record>,
-    connected: impl Fn(&str) -> bool,
-) -> Value {
-    Value::Object(
-        records
-            .iter()
-            .map(|(serial, r)| {
-                let mut v = serde_json::to_value(r).unwrap_or(json!({}));
-                v["connected"] = json!(connected(serial));
-                (serial.clone(), v)
-            })
-            .collect(),
-    )
 }

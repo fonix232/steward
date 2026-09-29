@@ -178,6 +178,10 @@ impl Devices {
         fs::rename(&tmp, &self.path).map_err(io)
     }
 
+    pub fn get_standing(&self, serial: &str) -> Option<Standing> {
+        self.records.get(serial).map(|r| r.standing)
+    }
+
     pub fn all(&self) -> &BTreeMap<String, Record> {
         &self.records
     }

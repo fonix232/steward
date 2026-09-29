@@ -16,7 +16,13 @@ tokio-tungstenite.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 ring.workspace = true
+steward-ubus.workspace = true
+axum.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 
 [dev-dependencies]
-# A paused clock: the time limits are tested without waiting them out.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# A paused clock: the time limits and the event stream's re-check are tested without waiting.
 tokio = { workspace = true, features = ["test-util"] }
