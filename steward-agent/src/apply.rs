@@ -212,6 +212,11 @@ pub fn stage(state: &State, config: &Value, rollback: Duration) -> Result<Staged
                 section,
                 values,
             } => t.set(config, section, Value::Object(values.clone())),
+            Op::Unset {
+                config,
+                section,
+                options,
+            } => t.unset(config, section, options),
             Op::Delete { config, section } => t.delete(config, section),
         }
         .map_err(|e| staging_failed(op, e))?;

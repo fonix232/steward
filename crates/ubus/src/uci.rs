@@ -100,6 +100,15 @@ impl Transaction {
         self.uci("get", json!({ "config": config }))
     }
 
+    /// Removes options from a section.
+    pub fn unset(&mut self, config: &str, section: &str, options: &[String]) -> Result<()> {
+        self.uci(
+            "delete",
+            json!({ "config": config, "section": section, "options": options }),
+        )
+        .map(drop)
+    }
+
     /// The staged changes, per config, as `uci changes` lists them.
     pub fn changes(&mut self) -> Result<Map<String, Value>> {
         Ok(match self.uci("changes", json!({}))?.remove("changes") {

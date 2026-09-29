@@ -10,9 +10,11 @@
 //! [`Plan::radio_options`], for the agent to record what it replaces.
 
 mod network;
+mod security;
 
 pub use network::{Network, Ports, Vlan};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use steward_proto::Rejection;
 
 /// The option that marks a section as the agent's.
@@ -35,6 +37,12 @@ pub enum Op {
         config: String,
         section: String,
         values: Map<String, Value>,
+    },
+    /// Remove options from a section the agent owns.
+    Unset {
+        config: String,
+        section: String,
+        options: Vec<String>,
     },
     /// Delete a section.
     Delete { config: String, section: String },
@@ -63,6 +71,11 @@ impl std::fmt::Display for Op {
                 section,
                 values,
             } => write!(f, "set {config} {section} ({})", names(values)),
+            Op::Unset {
+                config,
+                section,
+                options,
+            } => write!(f, "unset {config} {section} ({})", options.join(", ")),
             Op::Delete { config, section } => write!(f, "delete {config} {section}"),
         }
     }
@@ -92,6 +105,8 @@ pub struct Wireless {
     pub radios: Vec<Radio>,
     /// The `wifi-iface` sections the agent owns.
     pub owned: Vec<String>,
+    /// The options each owned section has now.
+    pub options: BTreeMap<String, Vec<String>>,
 }
 
 impl Wireless {
@@ -118,7 +133,8 @@ impl Wireless {
                     if name.starts_with(PREFIX)
                         && s.get(MARKER).and_then(Value::as_str) == Some("1") =>
                 {
-                    w.owned.push(name.clone())
+                    w.owned.push(name.clone());
+                    w.options.insert(name.clone(), options_of(s));
                 }
                 _ => {}
             }
@@ -160,6 +176,53 @@ impl Wireless {
 
     fn radio(&self, band: &str) -> Option<&Radio> {
         self.radios.iter().find(|r| r.band == band)
+    }
+}
+
+/// A section's option names, without UCI's `.name`, `.type` and the like.
+pub(crate) fn options_of(section: &Value) -> Vec<String> {
+    section
+        .as_object()
+        .map(|s| s.keys().filter(|k| !k.starts_with('.')).cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Adds an owned section, or, when the agent made it before (`had` its options), sets it again
+/// and removes the options it had that `values` doesn't give: a stale `auth_server` would keep
+/// sending clients to a RADIUS server.
+pub(crate) fn put(
+    plan: &mut Plan,
+    config: &str,
+    kind: &str,
+    section: &str,
+    values: Map<String, Value>,
+    had: Option<&Vec<String>>,
+) {
+    let Some(had) = had else {
+        plan.ops.push(Op::Add {
+            config: config.into(),
+            kind: kind.into(),
+            name: section.into(),
+            values,
+        });
+        return;
+    };
+    let stale: Vec<String> = had
+        .iter()
+        .filter(|o| !values.contains_key(o.as_str()))
+        .cloned()
+        .collect();
+    plan.ops.push(Op::Set {
+        config: config.into(),
+        section: section.into(),
+        values,
+    });
+    if !stale.is_empty() {
+        plan.ops.push(Op::Unset {
+            config: config.into(),
+            section: section.into(),
+            options: stale,
+        });
     }
 }
 
@@ -309,13 +372,19 @@ fn uci_bool(b: bool) -> Value {
 /// A true/false option of `object`, false when absent. Anything but a boolean is rejected
 /// (and taken as false), not guessed at.
 fn flag(plan: &mut Plan, object: &Value, path: &str) -> bool {
+    boolean(plan, object, path).unwrap_or(false)
+}
+
+/// A true/false option of `object` (the last part of `path`), `None` when absent. Anything but
+/// a boolean is rejected (and taken as absent), not guessed at.
+pub(crate) fn boolean(plan: &mut Plan, object: &Value, path: &str) -> Option<bool> {
     let key = path.rsplit('/').next().unwrap_or(path);
     match object.get(key) {
-        None => false,
-        Some(Value::Bool(b)) => *b,
+        None => None,
+        Some(Value::Bool(b)) => Some(*b),
         Some(other) => {
             reject(plan, path, other, format!("{key} is true or false"));
-            false
+            None
         }
     }
 }
@@ -502,32 +571,17 @@ fn radios(config: &Value, current: &Wireless, plan: &mut Plan) {
     }
 }
 
-/// uCentral's encryption to UCI's: the `encryption` value, and whether a key is needed.
-fn encryption(proto: &str) -> Option<(&'static str, bool)> {
-    Some(match proto {
-        "none" => ("none", false),
-        "owe" => ("owe", false),
-        "psk" => ("psk", true),
-        "psk2" => ("psk2", true),
-        "psk-mixed" => ("psk-mixed", true),
-        "sae" => ("sae", true),
-        "sae-mixed" => ("sae-mixed", true),
-        _ => return None,
-    })
-}
-
 /// The keys of an SSID that [`ssids`] handles; any other is rejected.
-const SSID_KEYS: [&str; 6] = [
+const SSID_KEYS: [&str; 8] = [
     "name",
     "wifi-bands",
     "bss-mode",
     "encryption",
     "hidden-ssid",
     "isolate-clients",
+    "radius",
+    "certificates",
 ];
-
-/// The keys of an SSID's `encryption` that [`ssids`] handles; any other is rejected.
-const ENCRYPTION_KEYS: [&str; 3] = ["proto", "key", "ieee80211w"];
 
 /// The SSIDs: one owned `wifi-iface` per SSID per band.
 fn ssids(
@@ -607,103 +661,9 @@ fn ssids(
                 );
                 continue;
             }
-            // No encryption is an open network; an encryption without a protocol isn't.
-            let enc = ssid
-                .get("encryption")
-                .cloned()
-                .unwrap_or(json!({ "proto": "none" }));
-            let Some(proto) = enc.get("proto").and_then(Value::as_str) else {
-                reject(
-                    plan,
-                    &path("encryption"),
-                    &enc,
-                    "an encryption names its proto",
-                );
+            let Some(security) = security::Security::of(ssid, &at, plan) else {
                 continue;
             };
-            let Some((uci_enc, needs_key)) = encryption(proto) else {
-                reject(
-                    plan,
-                    &path("encryption/proto"),
-                    &json!(proto),
-                    format!("{proto} isn't supported yet"),
-                );
-                continue;
-            };
-            let key = enc.get("key").and_then(Value::as_str);
-            // A passphrase is 8 to 63 printable characters: hostapd reads its config a line at a
-            // time, so a newline in one would add a line of its own. 64 hex digits are a PSK
-            // itself, which SAE can't use: the scripts would leave it without a password.
-            let sae = uci_enc.starts_with("sae");
-            if needs_key
-                && !key.is_some_and(|k| {
-                    ((8..=63).contains(&k.len()) && k.bytes().all(|b| (32..=126).contains(&b)))
-                        || (!sae && k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit()))
-                })
-            {
-                let reason = if sae {
-                    "an SAE key is 8 to 63 printable characters"
-                } else {
-                    "a key is 8 to 63 printable characters, or 64 hex digits"
-                };
-                reject(plan, &path("encryption/key"), &json!("…"), reason);
-                continue;
-            }
-            if let (false, Some(v)) = (needs_key, enc.get("key")) {
-                // Dropped quietly, it would answer 0 for an SSID its operator believes is keyed.
-                reject(
-                    plan,
-                    &path("encryption/key"),
-                    v,
-                    format!("{proto} takes no key: only the PSK and SAE modes do"),
-                );
-            }
-            // Management frame protection, one of TIP's values. Anything else refuses the SSID
-            // rather than running it with less protection than asked.
-            let Some(asked_mfp) = enc.get("ieee80211w").map_or(Some("disabled"), |m| {
-                m.as_str()
-                    .filter(|m| ["disabled", "optional", "required"].contains(m))
-            }) else {
-                reject(
-                    plan,
-                    &path("encryption/ieee80211w"),
-                    &enc["ieee80211w"],
-                    "ieee80211w is disabled, optional or required",
-                );
-                continue;
-            };
-            let configured = match asked_mfp {
-                "required" => "2",
-                "optional" => "1",
-                _ => "0",
-            };
-            // What the protocol runs: sae and owe with it required, sae-mixed at least optional
-            // (its SAE clients need it), open and WPA1-only networks without it (the scripts
-            // write ieee80211w=0 there). An ieee80211w asked otherwise is a substitution, so the
-            // answer says what runs.
-            let mfp = match uci_enc {
-                "sae" | "owe" => "2",
-                "sae-mixed" => configured.max("1"),
-                "none" | "psk" => "0",
-                _ => configured,
-            };
-            if enc.get("ieee80211w").is_some() && mfp != configured {
-                let named = match mfp {
-                    "2" => "required",
-                    "1" => "optional",
-                    _ => "disabled",
-                };
-                let reason = if mfp == "0" {
-                    format!("{uci_enc} has no management frame protection")
-                } else {
-                    format!("{uci_enc} needs management frame protection {named}")
-                };
-                plan.rejected.push(Rejection {
-                    parameter: json!({ path("encryption/ieee80211w"): enc["ieee80211w"] }),
-                    reason,
-                    substitution: Some(json!(named)),
-                });
-            }
             let Some(bands) = ssid
                 .get("wifi-bands")
                 .and_then(Value::as_array)
@@ -719,7 +679,6 @@ fn ssids(
             };
             // Multi-PSK, captive portals, RADIUS, rate limits, ACLs, raw hostapd lines...
             unsupported(plan, &at, ssid, &SSID_KEYS);
-            unsupported(plan, &path("encryption"), &enc, &ENCRYPTION_KEYS);
             let (hidden, isolate) = (
                 flag(plan, ssid, &path("hidden-ssid")),
                 flag(plan, ssid, &path("isolate-clients")),
@@ -746,34 +705,26 @@ fn ssids(
                 if wanted.contains(&section) {
                     continue;
                 }
-                let mut values = Map::new();
+                let band_at = format!("{}/{b}", path("wifi-bands"));
+                let Some(mut values) = security.on(&radio.band, &at, &band_at, plan) else {
+                    continue;
+                };
                 values.insert("device".into(), json!(radio.section));
                 values.insert("mode".into(), json!("ap"));
                 values.insert("ssid".into(), json!(name));
                 values.insert("network".into(), json!(network));
-                values.insert("encryption".into(), json!(uci_enc));
-                if let (true, Some(k)) = (needs_key, key) {
-                    values.insert("key".into(), json!(k));
-                }
-                values.insert("ieee80211w".into(), json!(mfp));
                 values.insert("hidden".into(), uci_bool(hidden));
                 values.insert("isolate".into(), uci_bool(isolate));
                 values.insert("disabled".into(), json!("0"));
                 values.insert(MARKER.into(), json!("1"));
-                plan.ops.push(if current.owned.contains(&section) {
-                    Op::Set {
-                        config: "wireless".into(),
-                        section: section.clone(),
-                        values,
-                    }
-                } else {
-                    Op::Add {
-                        config: "wireless".into(),
-                        kind: "wifi-iface".into(),
-                        name: section.clone(),
-                        values,
-                    }
-                });
+                put(
+                    plan,
+                    "wireless",
+                    "wifi-iface",
+                    &section,
+                    values,
+                    current.options.get(&section),
+                );
                 wanted.push(section);
             }
         }

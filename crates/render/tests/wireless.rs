@@ -42,14 +42,16 @@ fn config() -> Value {
 fn find<'a>(plan: &'a Plan, section: &str) -> Option<&'a Op> {
     plan.ops.iter().find(|op| match op {
         Op::Add { name, .. } => name == section,
-        Op::Set { section: s, .. } | Op::Delete { section: s, .. } => s == section,
+        Op::Set { section: s, .. }
+        | Op::Unset { section: s, .. }
+        | Op::Delete { section: s, .. } => s == section,
     })
 }
 
 fn values(op: &Op) -> &Map<String, Value> {
     match op {
         Op::Add { values, .. } | Op::Set { values, .. } => values,
-        Op::Delete { .. } => panic!("a delete has no values"),
+        Op::Unset { .. } | Op::Delete { .. } => panic!("no values"),
     }
 }
 
@@ -121,7 +123,9 @@ fn what_it_cant_do_comes_back_as_rejections() {
         "{reasons:?}"
     );
     assert!(
-        reasons.iter().any(|r| r.contains("wpa2 isn't supported")),
+        reasons
+            .iter()
+            .any(|r| r.contains("wpa2 needs a RADIUS authentication server")),
         "{reasons:?}"
     );
     assert!(
@@ -195,7 +199,7 @@ fn every_option_exists_in_the_wifi_scripts_schema() {
                 section, values, ..
             } if section.starts_with("radio") => ("wifi-device", values),
             Op::Set { values, .. } => ("wifi-iface", values),
-            Op::Delete { .. } => continue,
+            Op::Unset { .. } | Op::Delete { .. } => continue,
         };
         for option in vals.keys().filter(|k| k.as_str() != MARKER) {
             assert!(
@@ -651,17 +655,16 @@ fn encryption_is_read_strictly() {
         &current(),
     );
     assert!(
-        reasons(&plan).contains("key-caching isn't supported yet")
+        reasons(&plan).contains("key-caching works on 802.1X (enterprise) SSIDs only")
             && reasons(&plan).contains("unknown-thing isn't supported yet"),
         "{}",
         reasons(&plan)
     );
-    assert!(
-        plan.rejected[0]
-            .parameter
+    assert!(plan.rejected.iter().any(|r| {
+        r.parameter
             .get("/interfaces/0/ssids/0/encryption/key-caching")
             .is_some()
-    );
+    }));
     assert!(!reasons(&plan).contains("correct horse"));
     assert_eq!(
         values(find(&plan, "stw_0_0_5g").unwrap())["encryption"],
@@ -827,8 +830,8 @@ fn a_band_listed_twice_is_added_once() {
 fn an_op_shows_names_not_values() {
     let plan = wireless(&config(), &current());
     let shown: Vec<String> = plan.ops.iter().map(Op::to_string).collect();
-    let home = "add wireless wifi-iface stw_0_0_5g (device, mode, ssid, network, encryption, \
-                key, ieee80211w, hidden, isolate, disabled, steward)";
+    let home = "add wireless wifi-iface stw_0_0_5g (key, encryption, ieee80211w, device, mode, \
+                ssid, network, hidden, isolate, disabled, steward)";
     assert!(shown.iter().any(|s| s == home), "{shown:?}");
     assert!(
         shown.iter().any(|s| s == "delete wireless stw_9_9_5g"),

@@ -88,9 +88,20 @@ So Steward renders the schema itself (`crates/render`), into UCI sections the ag
   - A band given twice: the first entry is applied, the others are refused.
 - **SSIDs:** one `wifi-iface` per SSID per band, `stw_<interface>_<ssid>_<band>`. A band listed twice in `wifi-bands` is one section.
   - Ownership: a `wifi-iface` is the agent's only when it's named `stw_*` and marked `steward '1'`. Only those are deleted when the configuration no longer has them: a section of the user's that carries the marker isn't one.
-  - Encryption: none, owe, psk, psk2, psk-mixed, sae, sae-mixed. Keys are 8 to 63 printable characters (hostapd reads its config a line at a time, so a newline would add a line) or 64 hex digits; SAE modes take only the former, because the scripts write a 64-hex key as `wpa_psk` and leave SAE without a password. No `encryption` is an open network; an `encryption` without a `proto` refuses the SSID rather than opening it. A `key` on a mode that takes none (none, owe) is rejected, redacted, and the SSID runs as its proto says: dropped quietly, it would answer 0 for an SSID its operator believes is keyed.
-  - MFP: `ieee80211w` is `disabled` (the default), `optional` or `required`, TIP's values; anything else refuses the SSID rather than running it with less protection than asked. sae and owe run with it required, sae-mixed at least optional (its SAE clients need it), none and psk (WPA1) without it (the scripts write `ieee80211w=0` there); an `ieee80211w` asked otherwise is a substitution, so the answer says what runs.
+  - Encryption (`crates/render/src/security.rs`): none, owe, psk, psk2, psk-mixed, sae, sae-mixed, and the enterprise modes wpa, wpa2, wpa-mixed, wpa3, wpa3-mixed, wpa3-192. UCI's `encryption` takes the same names. Keys are 8 to 63 printable characters or 64 hex digits; SAE modes take only the former, because the scripts write a 64-hex key as `wpa_psk` and leave SAE without a password. A `key` on a mode that takes none (none, owe, the enterprise modes) is refused rather than dropped, and the SSID runs as its `proto` says. No `encryption` is an open network; an `encryption` without a `proto` refuses the SSID rather than opening it.
+  - MFP: required for sae, owe, wpa3 and wpa3-192; at least optional for sae-mixed and wpa3-mixed (their SAE and WPA3 clients need it); off for none, psk and wpa, which have none (a configured one is a substitution: the scripts would write `ieee80211w=0` and a SHA-256 AKM WPA1 clients don't know); as configured otherwise. A configured `ieee80211w` below what the protocol needs is a substitution as well, so the answer says what runs. `ieee80211w` is `disabled`, `optional` or `required`, and any other value refuses the SSID rather than run it with less protection than was asked for.
+  - 6 GHz runs only WPA3 and OWE: sae-mixed becomes sae and wpa3-mixed becomes wpa3 there (a substitution in the answer, and so is an `ieee80211w` asked lower than the required it runs with), and any other mode is refused for that band.
+  - RADIUS (`radius`): an enterprise SSID needs `authentication` (host, port, secret); `mac-filter` puts a server on an open, OWE, PSK or SAE SSID, which the wifi scripts turn into `macaddr_acl=2` (the client's MAC as the RADIUS user). `accounting` works on any SSID. An `authentication` server on such an SSID without `mac-filter` isn't used, so it's refused. `mac-filter` on an enterprise SSID refuses it: the scripts do MAC authentication only on open, OWE, PSK and SAE SSIDs, so it would be dropped. A `mac-filter` that isn't a boolean refuses the SSID, and so does a `radius` or `authentication` that isn't an object: read as off, it would run the SSID without MAC authentication.
+    - Options: `auth_server`/`auth_port`/`auth_secret`, `acct_server`/`acct_port`/`acct_secret`/`acct_interval`, `nasid`, `request_cui` (chargeable-user-id), `dae_client`/`dae_port`/`dae_secret` (dynamic authorization), `radius_auth_req_attr`/`radius_acct_req_attr`, `eap_reauth_period`, and `auth_cache` (key caching: on unless the config says otherwise, where the scripts' default for EAP is off).
+    - Bounds are the schema's: `eap-reauth-period` 0 to 86400 (hostapd reads it with atoi, so from 2^31 it turns negative, "invalid period", and the radio fails) and `interval` 60 to 600. `eap-reauth-period` and `key-caching` are EAP's: on any other SSID they're refused, unless they hold the schema's default (3600, true), which changes nothing. A value of the wrong kind (`"600"`, `"false"`, a `request-attribute` that isn't a list) is rejected and left to the default, and a dynamic authorization port only takes 3799 when it's missing.
+    - Dynamic authorization only on enterprise SSIDs: the scripts add its secret to `radius_das_client` only in their EAP branch but write the line for every SSID, and hostapd refuses a client without a secret, which fails the whole radio. `nas-identifier`, `chargeable-user-id` and `dynamic-authorization` on an SSID with no RADIUS server are refused, not dropped.
+    - hostapd takes a server's address, never a name. Stock hostapd has one port and secret per server list, so a `secondary` server is a second address when it shares them, and refused otherwise.
+    - Request attributes are hostapd's `<id>:s:<text>`, `<id>:d:<number>` (32 bits), `<id>:x:<hex>`, and vendor attributes `26:x:<vendor, 8 hex digits><type><length><value>` (vendor 1 to 65535, the schema's bounds, with at least one attribute, each id 1 to 255). A value is 253 bytes at most, the vendor attribute's 4-byte id and sub-attributes included: hostapd loads a longer one, then fails every request it would go in, so nobody could authenticate.
+    - RADIUS-assigned VLANs stay off (`dynamic_vlan` 0).
+    - OpenWrt's generator writes an EAP network's accounting server twice. That's stock behaviour, the same for LuCI's networks.
+  - No string with a control character is written into an option hostapd reads: most are written unquoted, one per line, so a newline would add a line of its own.
   - Network: its interface's (below).
+  - An owned section set again loses the options the configuration no longer gives it (`Op::Unset`), for example a network that stops using RADIUS.
 - **Interfaces** are layer-2 networks (`crates/render/src/network.rs`):
   - An interface is an object; anything else is refused (read as one without fields, it would be the device's `lan`). `role` is TIP's `upstream` or `downstream`; both render alike, so another value is rejected on its own.
   - Without `vlan`: the device's own `lan`, untouched.
@@ -110,8 +121,10 @@ So Steward renders the schema itself (`crates/render`), into UCI sections the ag
   - top level: `uuid`, `radios`, `interfaces`;
   - radio: `band`, `channel`, `channel-mode`, `channel-width`, `country`, `tx-power`, `enable`;
   - interface: `name`, `role`, `vlan` (`id`, `proto`), `ethernet` (`select-ports`, `vlan-tag`), `ssids`, `ipv4`;
-  - SSID: `name`, `wifi-bands`, `bss-mode`, `encryption`, `hidden-ssid`, `isolate-clients`;
-  - encryption: `proto`, `key`, `ieee80211w`.
+  - SSID: `name`, `wifi-bands`, `bss-mode`, `encryption`, `hidden-ssid`, `isolate-clients`, `radius`, `certificates`;
+  - `encryption`: `proto`, `key`, `ieee80211w`, `key-caching`, `eap-reauth-period`;
+  - `radius`: `authentication` (`host`, `port`, `secret`, `secondary`, `request-attribute`, `mac-filter`), `accounting` (`host`, `port`, `secret`, `secondary`, `request-attribute`, `interval`), `dynamic-authorization` (`host`, `port`, `secret`), `nas-identifier`, `chargeable-user-id`, and `local` and `health`, refused on their own; a `secondary`: `host`, `port`, `secret`;
+  - request attribute: `id` with `value` or with `hex-value`, or `vendor-id` with `vendor-attributes` (`id`, `value`), each form reading only its own keys.
 
   A value of the wrong kind (`"20"` for a tx power, `"yes"` for a boolean, an SSID without bands) is rejected, never guessed at.
 - **Rejected** (the answer's `rejected` list):
@@ -119,11 +132,11 @@ So Steward renders the schema itself (`crates/render`), into UCI sections the ag
   - bands the device lacks; `5G-lower`/`5G-upper`, `HaLow`;
   - channels, widths and modes the band or the radio doesn't have (above);
   - mesh and WDS modes;
-  - enterprise and RADIUS modes;
-  - multi-PSK, captive portals, pass-point, rate limits and ACLs;
+  - an enterprise SSID without a complete RADIUS server; a server given by name; `radius.local` and `certificates` (hostapd's built-in EAP server, STW-60); `radius.health`; `psk2-radius` and `mpsk-radius`, multi-PSK (STW-21), `owe-transition`;
+  - captive portals, pass-point, rate limits and ACLs;
   - raw hostapd lines.
 
-  A rejection shows what was sent, redacted: every value under a key naming a key, password, passphrase or secret, and raw lines (`*-raw`), become `…`, however deep.
+  A rejection shows what was sent, redacted: every value under a key naming a key, password, passphrase or secret, and raw lines (`*-raw`), become `…`, however deep. An object that holds secrets (`radius`, a RADIUS server, `certificates`) sent as anything else is shown as `…` whole.
 - `tests/wireless-schema.json` lists the options the wifi scripts read (from `/usr/share/schema/wireless.*.json`), and `tests/network-schema.json` those netifd reads (its `vlan_attrs` and `iface_attrs`). Tests check every written option against them.
 
 ## TLS and trust

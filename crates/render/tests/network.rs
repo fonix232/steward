@@ -57,14 +57,16 @@ fn ssid(name: &str) -> Value {
 fn find<'a>(plan: &'a Plan, section: &str) -> Option<&'a Op> {
     plan.ops.iter().find(|op| match op {
         Op::Add { name, .. } => name == section,
-        Op::Set { section: s, .. } | Op::Delete { section: s, .. } => s == section,
+        Op::Set { section: s, .. }
+        | Op::Unset { section: s, .. }
+        | Op::Delete { section: s, .. } => s == section,
     })
 }
 
 fn values(op: &Op) -> &Map<String, Value> {
     match op {
         Op::Add { values, .. } | Op::Set { values, .. } => values,
-        Op::Delete { .. } => panic!("a delete has no values"),
+        Op::Unset { .. } | Op::Delete { .. } => panic!("no values"),
     }
 }
 

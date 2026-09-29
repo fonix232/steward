@@ -9,7 +9,7 @@
 //!   selects (all bridge ports by default), and an owned interface `stw_vlan<vid>`
 //!   (proto none) unless one already sits on `<bridge>.<vid>`.
 
-use crate::{MARKER, Op, PREFIX, Plan, reject, unsupported};
+use crate::{MARKER, PREFIX, Plan, options_of, reject, unsupported};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
@@ -82,6 +82,8 @@ pub struct Network {
     pub interfaces: BTreeMap<String, String>,
     /// (section, type) the agent owns.
     pub owned: Vec<(String, String)>,
+    /// The options each owned section has now.
+    pub options: BTreeMap<String, Vec<String>>,
 }
 
 fn list(v: &Value) -> Vec<String> {
@@ -141,6 +143,7 @@ impl Network {
                 && let Some(t) = kind(s)
             {
                 n.owned.push((name.clone(), t));
+                n.options.insert(name.clone(), options_of(s));
             }
         }
         // The LAN bridge when there are several.
@@ -170,22 +173,14 @@ impl Network {
         self.owned.iter().any(|(s, _)| s == section)
     }
 
-    /// Adds an owned section, or sets it again when the agent made it before.
+    /// Adds an owned section, or sets it again (dropping options it no longer has) when the
+    /// agent made it before.
     fn put(&self, plan: &mut Plan, kind: &str, section: &str, values: Map<String, Value>) {
-        plan.ops.push(if self.is_owned(section) {
-            Op::Set {
-                config: "network".into(),
-                section: section.into(),
-                values,
-            }
-        } else {
-            Op::Add {
-                config: "network".into(),
-                kind: kind.into(),
-                name: section.into(),
-                values,
-            }
-        });
+        let had = self
+            .is_owned(section)
+            .then(|| self.options.get(section))
+            .flatten();
+        crate::put(plan, "network", kind, section, values, had);
     }
 }
 
