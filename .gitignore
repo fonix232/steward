@@ -1,6 +1,12 @@
+# Cargo
+target/
+
 # macOS Finder metadata. Written into any directory the Finder has merely
 # looked at, so it turns up anywhere.
 .DS_Store
+
+# Local static builds for testing on devices
+target-musl/
 
 # AI tooling: per-user runtime state only. .claude/agents|commands|skills are symlinks into
 # .ai/ and stay tracked.
