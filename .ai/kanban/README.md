@@ -6,14 +6,13 @@ The project's tasks, one Markdown card each, kept with [kanban](https://github.c
 | --- | --- |
 | [Backlog](backlog/_backlog.md) | 35 |
 | [Next](next/_next.md) | 4 |
-| [Ready to start](todo/_todo.md) | 13 |
+| [Ready to start](todo/_todo.md) | 12 |
 | [In progress](doing/_doing.md) | 0 |
 | [In review](review/_review.md) | 0 |
-| [Done](done/_done.md) | 5 |
+| [Done](done/_done.md) | 6 |
 
 ## Ready to start
 
-- [STW-5](todo/005-agent-controller-connection.md): Agent–controller connection
 - [STW-6](todo/006-find-the-controller-automatically.md): Find the controller automatically
 - [STW-7](todo/007-packages-and-per-architecture-feed.md): Packages and per-architecture feed
 - [STW-9](todo/009-encrypted-device-channel-wss.md): Encrypted device channel (wss://)
