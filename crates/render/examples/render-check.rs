@@ -6,7 +6,7 @@
 //! `--hostapd` also writes the SSIDs' planned options, with their bands, for
 //! `.ai/skills/device-testing/hostapd-check.uc`. That file holds the secrets: remove it after.
 use serde_json::{Map, Value, json};
-use steward_render::{Current, Network, Op, Ports, Usteer, Wireless, render};
+use steward_render::{Current, Network, Op, Poe, Ports, Usteer, Wireless, render};
 use steward_ubus::Ubus;
 use steward_ubus::uci::Transaction;
 
@@ -32,6 +32,14 @@ fn main() {
             .unwrap()
     };
     let (wireless, network) = (get("wireless"), get("network"));
+    let poe = ubus
+        .call(
+            "uci",
+            "get",
+            json!({ "config": "poe" }).as_object().unwrap(),
+        )
+        .ok()
+        .map(|p| Poe::from_uci(&p));
     let board: Value =
         serde_json::from_str(&std::fs::read_to_string("/etc/board.json").unwrap()).unwrap();
     let mut current = Wireless::from_uci(&wireless);
@@ -61,6 +69,7 @@ fn main() {
             wireless: &current,
             network: &Network::from_uci(&network),
             ports: &Ports::from_board(&board),
+            poe: poe.as_ref(),
         },
     );
     for r in &plan.rejected {
@@ -69,7 +78,12 @@ fn main() {
             None => println!("rejected: {} ({})", r.parameter, r.reason),
         }
     }
-    let mut t = Transaction::open(&["network", "wireless"]).unwrap();
+    let configs: &[&str] = if poe.is_some() {
+        &["network", "wireless", "poe"]
+    } else {
+        &["network", "wireless"]
+    };
+    let mut t = Transaction::open(configs).unwrap();
     for op in &plan.ops {
         let result = match op {
             Op::Add {

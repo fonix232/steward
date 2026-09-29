@@ -12,15 +12,17 @@
 //! State kept in the agent's state directory:
 //! - `running.json`: the uuid of the configuration the device runs, and the last one that
 //!   rolled back (refused until the controller sends another, so it can't loop).
-//! - `radio-originals.json`: what the device's own radio options held before the agent first
-//!   set them (`"<section>.<option>"` → value, or null for unset), to restore them later.
+//! - `originals.json`: what the device's own sections (radios, PoE ports) held before the agent
+//!   first set them (`"<config>.<section>.<option>"` → value, or null for unset), to restore
+//!   them later. It replaces `radio-originals.json` (radios only), which moves in on first use.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use steward_proto::{CommandStatus, Rejection, configure_error};
-use steward_render::{Current, Network, Op, Plan, Ports, Usteer, Wireless};
+use steward_render::{Current, Network, Op, Plan, Poe, Ports, Usteer, Wireless};
 use steward_ubus::Ubus;
 use steward_ubus::uci::Transaction;
 
@@ -74,18 +76,44 @@ impl State {
     }
 
     fn originals_path(&self) -> PathBuf {
-        self.dir.join("radio-originals.json")
+        self.dir.join("originals.json")
+    }
+
+    /// `originals.json`. An agent from before PoE kept only radios' originals, in
+    /// `radio-originals.json` (`"<section>.<option>"`): on first use they move in as
+    /// `wireless.<section>.<option>`, and the old file goes. They win over the same key in the
+    /// new file, which can only hold a value the agent had already set, recorded by an upgraded
+    /// agent that didn't know the old file.
+    fn originals(&self) -> Result<Map<String, Value>, String> {
+        let mut known: Map<String, Value> = read_json(&self.originals_path());
+        let old = self.dir.join("radio-originals.json");
+        if !old.exists() {
+            return Ok(known);
+        }
+        let radios: Map<String, Value> = read_json(&old);
+        for (key, value) in radios {
+            known.insert(format!("wireless.{key}"), value);
+        }
+        write_json(&self.originals_path(), &known)?;
+        std::fs::remove_file(&old).map_err(|e| format!("{}: {e}", old.display()))?;
+        Ok(known)
     }
 }
 
-/// Adds to `known` the original value of every radio option the plan sets and `known` doesn't
-/// hold yet: the first value the agent replaced is the one to restore.
-pub fn record_originals(known: &mut Map<String, Value>, plan: &Plan, current: &Map<String, Value>) {
-    for (section, option) in &plan.radio_options {
-        let key = format!("{section}.{option}");
+/// Adds to `known` the original value of every option on the device's own sections the plan
+/// sets and `known` doesn't hold yet: the first value the agent replaced is the one to restore.
+/// `current` is each config's `uci get` answer.
+pub fn record_originals(
+    known: &mut Map<String, Value>,
+    plan: &Plan,
+    current: &BTreeMap<&str, Map<String, Value>>,
+) {
+    for (config, section, option) in &plan.device_options {
+        let key = format!("{config}.{section}.{option}");
         if !known.contains_key(&key) {
             let value = current
-                .get("values")
+                .get(config.as_str())
+                .and_then(|c| c.get("values"))
                 .and_then(|v| v.get(section))
                 .and_then(|s| s.get(option))
                 .cloned();
@@ -180,6 +208,9 @@ pub fn stage(state: &State, config: &Value, rollback: Duration) -> Result<Staged
     let current = get("wireless")?;
     let network_uci = get("network")?;
     let network = Network::from_uci(&network_uci);
+    // realtek-poe's config, where the device powers ports.
+    let poe_config = get("poe").ok();
+    let poe = poe_config.as_ref().map(Poe::from_uci);
     let board: Value = std::fs::read_to_string("/etc/board.json")
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -204,12 +235,18 @@ pub fn stage(state: &State, config: &Value, rollback: Duration) -> Result<Staged
             wireless: &wireless,
             network: &network,
             ports: &Ports::from_board(&board),
+            poe: poe.as_ref(),
         },
     );
     if plan.ops.is_empty() {
         return nothing(plan, Transaction::pending);
     }
-    let mut t = Transaction::open(&["network", "wireless"]).map_err(|e| e.to_string())?;
+    let configs: &[&str] = if poe.is_some() {
+        &["network", "wireless", "poe"]
+    } else {
+        &["network", "wireless"]
+    };
+    let mut t = Transaction::open(configs).map_err(|e| e.to_string())?;
     for op in &plan.ops {
         match op {
             Op::Add {
@@ -232,13 +269,22 @@ pub fn stage(state: &State, config: &Value, rollback: Duration) -> Result<Staged
         }
         .map_err(|e| staging_failed(op, e))?;
     }
-    if unchanged(&mut t, &[("network", &network_uci), ("wireless", &current)])? {
+    // Every config staged, read back: poe too, or a change only to it would pass for none.
+    let mut staged = vec![("network", &network_uci), ("wireless", &current)];
+    if let Some(p) = &poe_config {
+        staged.push(("poe", p));
+    }
+    if unchanged(&mut t, &staged)? {
         // Every value was already what the plan sets.
         return nothing(plan, Transaction::pending);
     }
-    let before: Map<String, Value> = read_json(&state.originals_path());
+    let before = state.originals()?;
     let mut originals = before.clone();
-    record_originals(&mut originals, &plan, &current);
+    let mut answers = BTreeMap::from([("wireless", current)]);
+    if let Some(p) = poe_config {
+        answers.insert("poe", p);
+    }
+    record_originals(&mut originals, &plan, &answers);
     write_json(&state.originals_path(), &originals)?;
     if let Err(e) = t.apply(rollback) {
         // Nothing changed, so nothing was replaced: the next try records what's there then.
@@ -330,26 +376,41 @@ mod tests {
 
     #[test]
     fn the_first_replaced_value_is_the_one_kept() {
-        let current = json!({ "values": { "radio0": { "channel": "1", "htmode": "HT40" } } });
+        let answers = |wireless: Value, poe: Value| {
+            BTreeMap::from([
+                ("wireless", wireless.as_object().unwrap().clone()),
+                ("poe", poe.as_object().unwrap().clone()),
+            ])
+        };
         let plan = Plan {
-            radio_options: vec![
-                ("radio0".into(), "channel".into()),
-                ("radio0".into(), "txpower".into()),
+            device_options: vec![
+                ("wireless".into(), "radio0".into(), "channel".into()),
+                ("wireless".into(), "radio0".into(), "txpower".into()),
+                ("poe".into(), "cfg0a".into(), "enable".into()),
             ],
             ..Default::default()
         };
         let mut known = Map::new();
-        record_originals(&mut known, &plan, current.as_object().unwrap());
-        assert_eq!(known["radio0.channel"], "1");
+        let now = answers(
+            json!({ "values": { "radio0": { "channel": "1", "htmode": "HT40" } } }),
+            json!({ "values": { "cfg0a": { "enable": "1" } } }),
+        );
+        record_originals(&mut known, &plan, &now);
+        assert_eq!(known["wireless.radio0.channel"], "1");
+        assert_eq!(known["poe.cfg0a.enable"], "1");
         assert_eq!(
-            known["radio0.txpower"],
+            known["wireless.radio0.txpower"],
             Value::Null,
             "unset before: restore by removing"
         );
         // A later configuration sees the agent's own value: the original stays.
-        let later = json!({ "values": { "radio0": { "channel": "6" } } });
-        record_originals(&mut known, &plan, later.as_object().unwrap());
-        assert_eq!(known["radio0.channel"], "1");
+        let later = answers(
+            json!({ "values": { "radio0": { "channel": "6" } } }),
+            json!({ "values": { "cfg0a": { "enable": "0" } } }),
+        );
+        record_originals(&mut known, &plan, &later);
+        assert_eq!(known["wireless.radio0.channel"], "1");
+        assert_eq!(known["poe.cfg0a.enable"], "1");
     }
 
     /// Stands in for rpcd: records the calls, and answers each with the given result.
@@ -460,6 +521,46 @@ mod tests {
                 rolled_back: Some(8)
             }
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn radio_originals_from_before_move_into_originals_json() {
+        let dir = std::env::temp_dir().join(format!("steward-originals-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("radio-originals.json");
+        let new = dir.join("originals.json");
+        let state = State::new(&dir);
+        // Nothing kept yet: nothing to move.
+        assert!(state.originals().unwrap().is_empty());
+        assert!(!new.exists());
+        // An agent from before PoE kept radios' options without their config.
+        std::fs::write(
+            &old,
+            json!({ "radio0.channel": "1", "radio1.txpower": null }).to_string(),
+        )
+        .unwrap();
+        // An upgraded agent that didn't know the old file recorded its own channel as the
+        // original, and a PoE port's.
+        std::fs::write(
+            &new,
+            json!({ "wireless.radio0.channel": "6", "poe.cfg0a.enable": "1" }).to_string(),
+        )
+        .unwrap();
+        let known = state.originals().unwrap();
+        assert_eq!(
+            known["wireless.radio0.channel"], "1",
+            "the older record wins"
+        );
+        assert_eq!(known["wireless.radio1.txpower"], Value::Null);
+        assert_eq!(known["poe.cfg0a.enable"], "1");
+        assert_eq!(known.len(), 3);
+        assert!(!old.exists(), "the old file goes");
+        let written: Map<String, Value> = read_json(&new);
+        assert_eq!(written, known);
+        // The next use reads the new file alone.
+        assert_eq!(state.originals().unwrap(), known);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

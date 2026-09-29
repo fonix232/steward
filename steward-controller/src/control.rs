@@ -1,5 +1,6 @@
 //! The controller's local control socket, `/var/run/steward-controller.sock` (root only), and the
-//! command-line side of it: `steward-controller devices | clients | adopt <serial> | forget <serial>`.
+//! command-line side of it: `steward-controller devices | clients | adopt <serial> |
+//! forget <serial> | powercycle <serial> <port>[:<ms>]…`.
 //! One JSON request per line, one JSON answer per line. The web interface will call the same
 //! operations through its API.
 
@@ -14,8 +15,16 @@ use std::path::Path;
 pub enum Request {
     Devices,
     Clients,
-    Adopt { serial: String },
-    Forget { serial: String },
+    Adopt {
+        serial: String,
+    },
+    Forget {
+        serial: String,
+    },
+    Powercycle {
+        serial: String,
+        ports: Vec<steward_proto::PowercyclePort>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

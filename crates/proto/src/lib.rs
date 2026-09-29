@@ -228,6 +228,26 @@ pub struct Configure {
     pub config: Value,
 }
 
+/// `powercycle`: turn PoE ports off for a while, then on again. The device answers at once
+/// (`error` 0, or 2 with the reason when it won't) and cycles in the background.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Powercycle {
+    pub serial: String,
+    pub ports: Vec<PowercyclePort>,
+    /// When: 0 now, otherwise a UTC time in seconds (a hint).
+    #[serde(default)]
+    pub when: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PowercyclePort {
+    /// The port, as the device names it (`lan3`) or as uCentral selects it (`LAN3`).
+    pub name: String,
+    /// How long it stays off, in ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle: Option<u64>,
+}
+
 /// The answer to a command: `{"serial", "uuid", "status"}` as the result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandResult {

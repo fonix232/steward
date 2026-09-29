@@ -44,8 +44,11 @@ impl Ports {
         }
     }
 
-    /// uCentral's `select-ports` patterns (`LAN*`, `LAN2`, `WAN*`, `WAN1`) → port names.
-    fn select(&self, pattern: &str) -> Option<Vec<String>> {
+    /// uCentral's `select-ports` patterns (`LAN*`, `LAN2`, `WAN*`, `WAN1`, `*`) → port names.
+    pub fn select(&self, pattern: &str) -> Option<Vec<String>> {
+        if pattern == "*" {
+            return Some(self.lan.iter().chain(&self.wan).cloned().collect());
+        }
         let p = pattern.to_ascii_uppercase();
         let (role, rest) = match p.strip_prefix("LAN") {
             Some(r) => (&self.lan, r),

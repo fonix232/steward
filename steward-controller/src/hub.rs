@@ -9,8 +9,12 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 use steward_proto::{self as proto, Message, command};
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+
+/// How long an operation waits for a device's answer to a command.
+const ANSWER_WAIT: Duration = Duration::from_secs(15);
 
 /// Where a connected device's messages go.
 pub enum Outgoing {
@@ -33,6 +37,9 @@ pub struct Device {
     pub adopt_id: Option<u64>,
     /// The id of the `configure` command awaiting its answer, and the uuid it carried.
     pub configure: Option<(u64, u64)>,
+    /// Operations waiting for the answer to a command, by its id: the answer, or `None` when
+    /// the device answered with an error.
+    pub waiting: HashMap<u64, oneshot::Sender<Option<proto::CommandResult>>>,
 }
 
 pub struct Registry {
@@ -336,6 +343,81 @@ impl Hub {
         }
     }
 
+    /// Power-cycles PoE ports on an adopted, connected device, and waits for its answer: the
+    /// device checks the ports and answers before it cycles them.
+    pub async fn powercycle(
+        &self,
+        serial: &str,
+        ports: Vec<proto::PowercyclePort>,
+    ) -> Result<proto::CommandStatus, OpError> {
+        valid_serial(serial)?;
+        let params = proto::Powercycle {
+            serial: serial.into(),
+            ports,
+            when: 0,
+        };
+        let (id, answer) = {
+            let mut reg = self.registry.lock().await;
+            match reg.devices.get_standing(serial) {
+                None => return Err(OpError::NotFound(format!("no device {serial}"))),
+                Some(Standing::Adopted) => {}
+                Some(_) => return Err(OpError::Conflict(format!("{serial} isn't adopted"))),
+            }
+            reg.next_id += 1;
+            let id = reg.next_id;
+            let Some(d) = reg.connected.get_mut(serial) else {
+                return Err(OpError::Conflict(format!("{serial} isn't connected")));
+            };
+            let m = Message::request(id, command::POWERCYCLE, &params)
+                .map_err(|e| OpError::Failed(e.to_string()))?;
+            let (tx, rx) = oneshot::channel();
+            d.waiting.insert(id, tx);
+            if d.tx.try_send(Outgoing::Send(m)).is_err() {
+                d.waiting.remove(&id);
+                return Err(OpError::Failed(format!("{serial}: its connection is busy")));
+            }
+            (id, rx)
+        };
+        crate::log!("{serial}: power cycle (command {id})");
+        match tokio::time::timeout(ANSWER_WAIT, answer).await {
+            Ok(Ok(Some(r))) => Ok(r.status),
+            Ok(Ok(None)) => Err(OpError::Failed(format!(
+                "{serial} couldn't take the command"
+            ))),
+            Ok(Err(_)) => Err(OpError::Failed(format!(
+                "{serial} disconnected before answering"
+            ))),
+            // The agent takes commands one at a time: behind a `configure` (up to minutes of
+            // retries and confirmation) this one waits, and still runs when its turn comes.
+            Err(_) => {
+                if let Some(d) = self.registry.lock().await.connected.get_mut(serial) {
+                    d.waiting.remove(&id);
+                }
+                Err(OpError::Failed(format!(
+                    "{serial} didn't answer command {id} in {} s. It takes one command at a \
+                     time and may be busy with another (applying a configuration, say): it may \
+                     still cycle the ports when it gets to this one. Its answer, if it comes, \
+                     goes to the controller's log.",
+                    ANSWER_WAIT.as_secs()
+                )))
+            }
+        }
+    }
+
+    /// Hands a device's answer to the operation waiting for it, if one is.
+    pub async fn answered(&self, serial: &str, id: u64, result: Option<proto::CommandResult>) {
+        let waiter = self
+            .registry
+            .lock()
+            .await
+            .connected
+            .get_mut(serial)
+            .and_then(|d| d.waiting.remove(&id));
+        if let Some(tx) = waiter {
+            let _ = tx.send(result);
+        }
+    }
+
     /// Sends a connected device its credential (`steward.adopt`); its answer completes the adoption.
     pub async fn send_credential(&self, serial: &str, credential: String) {
         let mut reg = self.registry.lock().await;
@@ -418,6 +500,7 @@ mod tests {
                 tx,
                 adopt_id: None,
                 configure: None,
+                waiting: HashMap::new(),
             },
         );
         // A state message wrote nothing; the controller stopping writes it, and when the
@@ -482,6 +565,147 @@ mod tests {
             reg.states.record(SERIAL, 0, state, true);
         }
         assert_eq!(hub.clients().await, json!([]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_power_cycle_waits_for_the_devices_answer() {
+        let dir = std::env::temp_dir().join(format!("steward-hub-pc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = std::sync::Arc::new(open(&dir));
+        let port = || {
+            vec![proto::PowercyclePort {
+                name: "lan1".into(),
+                cycle: None,
+            }]
+        };
+        assert!(matches!(
+            hub.powercycle(SERIAL, port()).await,
+            Err(OpError::NotFound(_))
+        ));
+        hub.registry
+            .lock()
+            .await
+            .devices
+            .admit(SERIAL, None, None, "OpenWrt", |_| false)
+            .unwrap();
+        let pending = hub.powercycle(SERIAL, port()).await.unwrap_err();
+        assert!(pending.to_string().contains("isn't adopted"), "{pending}");
+        {
+            let mut reg = hub.registry.lock().await;
+            reg.devices.adopt(SERIAL).unwrap();
+            reg.devices.issue(SERIAL).unwrap();
+            reg.devices.delivered(SERIAL, false).unwrap();
+        }
+        let offline = hub.powercycle(SERIAL, port()).await.unwrap_err();
+        assert!(offline.to_string().contains("isn't connected"), "{offline}");
+
+        let (tx, mut rx) = mpsc::channel(4);
+        hub.registry.lock().await.connected.insert(
+            SERIAL.into(),
+            Device {
+                addr: "192.0.2.4:40000".parse().unwrap(),
+                uuid: 0,
+                capabilities: json!({}),
+                seen: 0,
+                tx,
+                adopt_id: None,
+                configure: None,
+                waiting: HashMap::new(),
+            },
+        );
+        let h = hub.clone();
+        let asked = tokio::spawn(async move { h.powercycle(SERIAL, port()).await });
+        let Some(Outgoing::Send(Message::Request {
+            id, method, params, ..
+        })) = rx.recv().await
+        else {
+            panic!("no command sent");
+        };
+        assert_eq!(method, command::POWERCYCLE);
+        assert_eq!(params["ports"][0]["name"], "lan1");
+        // Another command's answer isn't this one's.
+        hub.answered(SERIAL, id + 1, None).await;
+        let refusal = CommandStatus {
+            error: 2,
+            text: "lan1 has no PoE".into(),
+            when: None,
+            rejected: vec![],
+        };
+        hub.answered(
+            SERIAL,
+            id,
+            Some(proto::CommandResult {
+                serial: SERIAL.into(),
+                uuid: None,
+                status: refusal.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(asked.await.unwrap().unwrap(), refusal);
+        assert!(
+            hub.registry.lock().await.connected[SERIAL]
+                .waiting
+                .is_empty()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A device busy with another command (a `configure`) answers late, and still cycles the
+    /// ports then: the timeout says so.
+    #[tokio::test(start_paused = true)]
+    async fn a_power_cycle_without_an_answer_may_still_happen() {
+        let dir = std::env::temp_dir().join(format!("steward-hub-pc-late-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = std::sync::Arc::new(open(&dir));
+        {
+            let mut reg = hub.registry.lock().await;
+            reg.devices
+                .admit(SERIAL, None, None, "OpenWrt", |_| false)
+                .unwrap();
+            reg.devices.adopt(SERIAL).unwrap();
+            reg.devices.issue(SERIAL).unwrap();
+            reg.devices.delivered(SERIAL, false).unwrap();
+        }
+        let (tx, mut rx) = mpsc::channel(4);
+        hub.registry.lock().await.connected.insert(
+            SERIAL.into(),
+            Device {
+                addr: "192.0.2.4:40000".parse().unwrap(),
+                uuid: 0,
+                capabilities: json!({}),
+                seen: 0,
+                tx,
+                adopt_id: None,
+                configure: None,
+                waiting: HashMap::new(),
+            },
+        );
+        let h = hub.clone();
+        let port = vec![proto::PowercyclePort {
+            name: "lan1".into(),
+            cycle: None,
+        }];
+        let asked = tokio::spawn(async move { h.powercycle(SERIAL, port).await });
+        let Some(Outgoing::Send(Message::Request { id, .. })) = rx.recv().await else {
+            panic!("no command sent");
+        };
+        let Err(OpError::Failed(text)) = asked.await.unwrap() else {
+            panic!("answered without the device");
+        };
+        assert!(
+            text.contains(&format!("didn't answer command {id} in 15 s")),
+            "{text}"
+        );
+        assert!(
+            text.contains("may still cycle the ports when it gets to this one"),
+            "{text}"
+        );
+        assert!(
+            hub.registry.lock().await.connected[SERIAL]
+                .waiting
+                .is_empty()
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

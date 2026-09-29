@@ -46,6 +46,7 @@ fn plan_for(config: &Value, network: &Network) -> Plan {
             wireless: &wireless(),
             network,
             ports: &ports(),
+            poe: None,
         },
     )
 }

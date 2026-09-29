@@ -63,6 +63,14 @@ The agent's `state` event (every minute) follows TIP's `state/*.yml`. `steward-a
   - A wired client goes where it was seen on the port with the fewest clients, i.e. the AP's port rather than the router's port towards the AP.
   - Names come from leases, which only the router has. A network of APs without an agent on the router has clients with no names and few IPs.
 - LLDP peers aren't reported yet.
+- **PoE**, a Steward addition to TIP's state, from realtek-poe's `poe info`: `unit.poe` has `budget` and `consumption` (W), and each powered port's `link-state` entry has `poe` (`status`, `mode`, `priority`, `consumption`). Without realtek-poe it's left out.
+
+## Commands Steward's agent runs
+
+- `configure` (above) and `steward.adopt` (below).
+- `powercycle` (`{ports: [{name, cycle}]}`): PoE ports off for `cycle` ms (5000 by default, 1 to 60000), then on, through `poe manage`. Ports are named as the board names them (`lan3`) or as uCentral selects them (`LAN3`, `LAN*`). The agent checks them against realtek-poe's config first, because `poe manage` answers OK for a port it won't touch (one whose power the config turns off). It also looks up the `poe` object: with the config there but the daemon stopped, the cycle would fail only after the answer, so it's refused. It answers 0 at once and cycles in the background, or 2 with the reason, cycling nothing. On the controller: `steward-controller powercycle <serial> <port>[:<ms>]…` and `POST /api/devices/<serial>/powercycle`, which wait up to 15 s for the answer (`Device::waiting`, by command id).
+  - The agent takes one command at a time, so a `powercycle` sent while it applies a configuration (up to minutes of retries and confirmation) waits its turn and still cycles the ports then, after the controller has stopped waiting. So the controller's timeout doesn't say the cycle failed: it says the device didn't answer command `<id>` in 15 s and may still cycle the ports when it gets to it, and the late answer goes to the controller's log (`<serial>: command <id>: …`).
+- Anything else is answered 1, `<method>: not supported`.
 
 ## Capabilities
 
@@ -124,9 +132,10 @@ So Steward renders the schema itself (`crates/render`), into UCI sections the ag
   - Ownership: a network section is the agent's only when it's named `stw_*` and marked `steward '1'`. A user's VLAN or interface that carries the marker is joined like anyone's, and never deleted.
   - The agent stages `network` and `wireless` in one transaction, so one rollback covers both.
 - **Handled keys** (anything else is rejected as `<key> isn't supported yet`, so an ignored field never gets answer 0):
-  - top level: `uuid`, `radios`, `interfaces`;
+  - top level: `uuid`, `radios`, `interfaces`, `ethernet`;
   - radio: `band`, `channel`, `channel-mode`, `channel-width`, `country`, `tx-power`, `enable`;
   - interface: `name`, `role`, `vlan` (`id`, `proto`), `ethernet` (`select-ports`, `vlan-tag`), `ssids`, `ipv4`;
+  - `ethernet` entry: `select-ports`, `poe` (`admin-mode`);
   - SSID: `name`, `wifi-bands`, `bss-mode`, `encryption`, `hidden-ssid`, `isolate-clients`, `radius`, `certificates`, `roaming`, `rrm`, `services`;
   - `encryption`: `proto`, `key`, `ieee80211w`, `key-caching`, `eap-reauth-period`;
   - `radius`: `authentication` (`host`, `port`, `secret`, `secondary`, `request-attribute`, `mac-filter`), `accounting` (`host`, `port`, `secret`, `secondary`, `request-attribute`, `interval`), `dynamic-authorization` (`host`, `port`, `secret`), `nas-identifier`, `chargeable-user-id`, and `local` and `health`, refused on their own; a `secondary`: `host`, `port`, `secret`;
@@ -136,6 +145,10 @@ So Steward renders the schema itself (`crates/render`), into UCI sections the ag
   - `services` entry: `wifi-steering`.
 
   A value of the wrong kind (`"20"` for a tx power, `"yes"` for a boolean, an SSID without bands) is rejected, never guessed at.
+- **PoE** (`crates/render/src/poe.rs`): `ethernet[].poe.admin-mode` sets `enable` on realtek-poe's `port` sections for the ports `select-ports` names (`LAN2`, `LAN*`, `*`, by board.json's roles; a wildcard skips ports without PoE). They're the device's own sections, so each option is in `Plan::device_options` and its original kept in `originals.json` (an agent from before PoE kept radios' in `radio-originals.json`, keyed `<section>.<option>`: they move in as `wireless.<section>.<option>` on first use, and the old file goes). realtek-poe reloads on the config change (a procd trigger), and the rollback covers `poe` with `network` and `wireless`.
+  - A port's `id` is read as realtek-poe reads it (`strtoul(id, NULL, 0)`: decimal, `0x` hex, a leading 0 octal, up to the first non-digit), and a port whose id isn't 1 to 48 is dropped, as realtek-poe drops it.
+  - `admin-mode` is a boolean: only a missing one takes the schema's default (on), and anything else (`"false"`, `0`, `null`) is refused, as is a `poe` that isn't an object.
+  - Refused as well: PoE without realtek-poe, a named port it doesn't power, a `select-ports` pattern that isn't a string (the entry's other patterns stand), a port given both modes (the first stands), an `ethernet` that isn't a list, and `ethernet`'s other keys (`speed`, `duplex`, `enabled`, `services`).
 - **Rejected** (the answer's `rejected` list):
   - any `ipv4` that asks for something (all but `addressing: none` and `send-hostname: true`): the device keeps its own addressing, and anything else in it would be dropped; a bridge that doesn't filter VLANs; VLAN ids outside 1 to 4094, or used twice; ports the board or the bridge lacks, or already untagged elsewhere;
   - bands the device lacks; `5G-lower`/`5G-upper`, `HaLow`;

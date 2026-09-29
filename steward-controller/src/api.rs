@@ -404,6 +404,26 @@ async fn forget(State(api): State<Api>, Path(serial): Path<String>) -> Response 
     }
 }
 
+/// `{"ports": [{"name", "cycle"}]}`: the device's answer (`error` 0, or 2 with the reason).
+async fn powercycle(
+    State(api): State<Api>,
+    Path(serial): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let ports = match serde_json::from_value::<Vec<steward_proto::PowercyclePort>>(
+        body.get("ports").cloned().unwrap_or(Value::Null),
+    ) {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            return error(StatusCode::BAD_REQUEST, "ports is a list of {name, cycle}");
+        }
+    };
+    match api.hub.powercycle(&serial, ports).await {
+        Ok(status) => Json(json!(status)).into_response(),
+        Err(e) => op_error(e),
+    }
+}
+
 async fn get_config(State(api): State<Api>, Path(serial): Path<String>) -> Response {
     match api.hub.config(&serial) {
         Ok(Some(c)) => Json(c).into_response(),
@@ -472,6 +492,7 @@ pub fn router(hub: Arc<Hub>, auth: Arc<dyn Auth>) -> Router {
         .route("/api/clients", get(clients))
         .route("/api/devices/{serial}/adopt", post(adopt))
         .route("/api/devices/{serial}/forget", post(forget))
+        .route("/api/devices/{serial}/powercycle", post(powercycle))
         .route(
             "/api/devices/{serial}/config",
             get(get_config).put(put_config),
@@ -1450,6 +1471,30 @@ mod tests {
         assert_eq!(body["devices"][SERIAL]["standing"], "adopted");
         assert!(!body.to_string().contains("credential_sha256"), "{body}");
         assert!(!hub.devices().await.to_string().contains("credential"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_power_cycle_needs_ports_and_a_reachable_device() {
+        let (app, _hub, dir) = app("powercycle").await;
+        let uri = format!("/api/devices/{SERIAL}/powercycle");
+        let (status, _, _) = call(&app, "POST", &uri, None, Some(json!({}))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        for body in [
+            json!({}),
+            json!({ "ports": [] }),
+            json!({ "ports": "lan1" }),
+        ] {
+            let (status, _, _) = call(&app, "POST", &uri, Some("t0k3n"), Some(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        let ports = json!({ "ports": [{ "name": "lan1", "cycle": 3000 }] });
+        // Pending: nothing is sent to it.
+        let (status, _, body) = call(&app, "POST", &uri, Some("t0k3n"), Some(ports.clone())).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let other = "/api/devices/00005e005399/powercycle";
+        let (status, _, _) = call(&app, "POST", other, Some("t0k3n"), Some(ports)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -5,15 +5,18 @@
 //! rollback, is the agent's job (`steward_ubus::uci::Transaction`).
 //!
 //! Ownership: the agent only ever creates sections it names `stw_*` and marks with
-//! `steward '1'`, and deletes only those. Radios are the exception: they are the device's
-//! own `wifi-device` sections, so the renderer sets options on them and lists each one in
-//! [`Plan::radio_options`], for the agent to record what it replaces.
+//! `steward '1'`, and deletes only those. The exceptions are the device's own sections that
+//! stand for hardware: radios (`wifi-device`) and PoE ports (realtek-poe's `port`). The
+//! renderer sets options on them and lists each one in [`Plan::device_options`], for the
+//! agent to record what it replaces.
 
 mod network;
+mod poe;
 mod roaming;
 mod security;
 
 pub use network::{Network, Ports, Vlan};
+pub use poe::{Poe, PoePort};
 pub use roaming::Usteer;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -87,8 +90,9 @@ impl std::fmt::Display for Op {
 pub struct Plan {
     pub ops: Vec<Op>,
     pub rejected: Vec<Rejection>,
-    /// (section, option) on the device's own radios that the plan sets.
-    pub radio_options: Vec<(String, String)>,
+    /// (config, section, option) on the device's own sections (radios, PoE ports) that the
+    /// plan sets.
+    pub device_options: Vec<(String, String, String)>,
 }
 
 /// A radio the device has: its `wifi-device` section and band (`2g`, `5g`, `6g`, `60g`).
@@ -565,8 +569,11 @@ fn radios(config: &Value, current: &Wireless, plan: &mut Plan) {
             Some(other) => reject(plan, &path("enable"), other, "enable is true or false"),
         }
         unsupported(plan, &format!("/radios/{i}"), r, &RADIO_KEYS);
-        plan.radio_options
-            .extend(values.keys().map(|k| (radio.section.clone(), k.clone())));
+        plan.device_options.extend(
+            values
+                .keys()
+                .map(|k| ("wireless".to_string(), radio.section.clone(), k.clone())),
+        );
         plan.ops.push(Op::Set {
             config: "wireless".into(),
             section: radio.section.clone(),
@@ -743,7 +750,7 @@ fn ssids(
 }
 
 /// The top-level keys this renderer handles; any other is rejected.
-const TOP_KEYS: [&str; 3] = ["uuid", "radios", "interfaces"];
+const TOP_KEYS: [&str; 4] = ["uuid", "radios", "interfaces", "ethernet"];
 
 /// Radios, SSIDs on `networks` (by interface), and the owned wireless sections no longer needed.
 /// Top-level keys it doesn't handle are rejected here, as both entry points pass through.
@@ -771,14 +778,17 @@ pub struct Current<'a> {
     pub wireless: &'a Wireless,
     pub network: &'a Network,
     pub ports: &'a Ports,
+    /// realtek-poe's config; `None` without it.
+    pub poe: Option<&'a Poe>,
 }
 
-/// A whole configuration: networks and VLANs, radios, and SSIDs on their networks. The
+/// A whole configuration: networks and VLANs, radios, SSIDs on their networks, and PoE. The
 /// network changes come first, so a new network exists before an SSID joins it.
 pub fn render(config: &Value, current: &Current<'_>) -> Plan {
     let mut plan = Plan::default();
     let (networks, wanted) = network::networks(config, current.network, current.ports, &mut plan);
     wireless_into(config, current.wireless, &networks, &mut plan);
+    poe::ethernet(config, current.poe, current.ports, &mut plan);
     for (stale, _) in current
         .network
         .owned

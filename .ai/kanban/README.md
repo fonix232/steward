@@ -5,11 +5,11 @@ The project's tasks, one Markdown card each, kept with [kanban](https://github.c
 | Column | Cards |
 | --- | --- |
 | [Backlog](backlog/_backlog.md) | 37 |
-| [Next](next/_next.md) | 2 |
+| [Next](next/_next.md) | 1 |
 | [Ready to start](todo/_todo.md) | 0 |
 | [In progress](doing/_doing.md) | 0 |
 | [In review](review/_review.md) | 1 |
-| [Done](done/_done.md) | 19 |
+| [Done](done/_done.md) | 20 |
 
 ## In review
 
@@ -17,5 +17,4 @@ The project's tasks, one Markdown card each, kept with [kanban](https://github.c
 
 ## Next
 
-- [STW-28](next/028-poe-control.md): PoE control
 - [STW-32](next/032-dhcp-and-dns.md): DHCP and DNS

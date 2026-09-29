@@ -67,6 +67,8 @@ pub struct Sources {
     pub leases: Vec<Lease>,
     /// The default gateway.
     pub gateway: Option<String>,
+    /// realtek-poe's `poe info`, where the device powers ports.
+    pub poe: Value,
 }
 
 /// What the last report's rates start from.
@@ -460,13 +462,24 @@ fn prune(v: Value) -> Value {
 
 /// The state document.
 pub fn document(s: &Sources, prev: &mut Previous) -> Value {
-    let unit = unit(s, prev);
+    let mut unit = unit(s, prev);
+    // PoE (a Steward addition to TIP's state): the budget and what's drawn, in W, and each
+    // powered port's status, mode, priority and draw with its link.
+    if s.poe.is_object() {
+        unit["poe"] = json!({ "budget": s.poe["budget"], "consumption": s.poe["consumption"] });
+    }
     let radios = radios(s, prev);
     let interfaces = interfaces(s, &radios);
     let role = |ports: &[String]| -> Map<String, Value> {
         ports
             .iter()
-            .filter_map(|p| Some((p.clone(), link(&s.devices[p])?)))
+            .filter_map(|p| {
+                let mut l = link(&s.devices[p])?;
+                if let Some(poe) = s.poe["ports"].get(p) {
+                    l["poe"] = poe.clone();
+                }
+                Some((p.clone(), l))
+            })
             .collect()
     };
     let doc = json!({
@@ -605,6 +618,7 @@ pub fn gather() -> Result<Sources, steward_ubus::Error> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    let poe = call("poe", "info", json!({}));
     Ok(Sources {
         now: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -624,6 +638,7 @@ pub fn gather() -> Result<Sources, steward_ubus::Error> {
         hints,
         leases,
         gateway: crate::device::default_gateway().map(|g| g.to_string()),
+        poe,
     })
 }
 
@@ -906,6 +921,33 @@ mod tests {
         );
         assert!(down.get("lan2").is_none(), "no such device: left out");
         assert_eq!(doc["link-state"]["upstream"]["wan"]["carrier"], false);
+    }
+
+    /// PoE, from realtek-poe's `poe info` (its `ubus_poe_info_cb`): the unit's budget and draw,
+    /// and each powered port's with its link. Without realtek-poe there's none.
+    #[test]
+    fn poe_is_reported_with_the_unit_and_its_ports() {
+        let mut s = sources();
+        assert!(
+            document(&s, &mut Previous::default())["unit"]
+                .get("poe")
+                .is_none()
+        );
+        s.poe = json!({ "firmware": "v17.1", "mcu": "ST Micro ST32F100 Microcontroller",
+                        "budget": 170.0, "consumption": 7.4,
+                        "ports": { "lan4": { "priority": 2, "mode": "PoE+", "status": "Delivering power",
+                                             "consumption": 7.4 },
+                                   "lan9": { "priority": 0, "status": "Disabled" } } });
+        let doc = document(&s, &mut Previous::default());
+        assert_eq!(
+            doc["unit"]["poe"],
+            json!({ "budget": 170.0, "consumption": 7.4 })
+        );
+        let lan4 = &doc["link-state"]["downstream"]["lan4"];
+        assert_eq!(lan4["poe"]["status"], "Delivering power");
+        assert_eq!(lan4["poe"]["consumption"], 7.4);
+        assert_eq!(lan4["carrier"], true, "with its link");
+        assert!(doc["link-state"]["downstream"]["lan1"].get("poe").is_none());
     }
 
     #[test]

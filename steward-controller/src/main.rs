@@ -83,7 +83,8 @@ const LOG_TEXT: usize = 128;
 const TOO_MANY_PENDING: &str = "too many devices waiting for adoption";
 
 const USAGE: &str = "usage: steward-controller [--listen <address:port>] [--web-listen <address:port>] [--state-dir <dir>] [--config-dir <dir>] [--control <socket>] [--plaintext] [--adopt-local]
-       steward-controller [--control <socket>] [--json] devices | clients | adopt <serial> | forget <serial>";
+       steward-controller [--control <socket>] [--json] devices | clients | adopt <serial> | forget <serial>
+       steward-controller [--control <socket>] powercycle <serial> <port>[:<ms>]...";
 
 struct Args {
     listen: String,
@@ -146,6 +147,27 @@ impl Args {
                     a.command = Some(Request::Forget {
                         serial: it.next().unwrap_or_else(|| usage()),
                     })
+                }
+                "powercycle" => {
+                    let serial = it.next().unwrap_or_else(|| usage());
+                    // <port>[:<ms>]…, to the end.
+                    let ports: Vec<proto::PowercyclePort> = it
+                        .by_ref()
+                        .map(|p| match p.split_once(':') {
+                            Some((name, ms)) => proto::PowercyclePort {
+                                name: name.into(),
+                                cycle: Some(ms.parse().unwrap_or_else(|_| usage())),
+                            },
+                            None => proto::PowercyclePort {
+                                name: p,
+                                cycle: None,
+                            },
+                        })
+                        .collect();
+                    if ports.is_empty() {
+                        usage();
+                    }
+                    a.command = Some(Request::Powercycle { serial, ports });
                 }
                 _ => usage(),
             }
@@ -464,6 +486,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     tx: tx.clone(),
                     adopt_id: None,
                     configure: None,
+                    waiting: std::collections::HashMap::new(),
                 },
             );
             if let Some(old) = replaced {
@@ -687,6 +710,7 @@ async fn handle(serial: &str, m: Message, hub: &Hub) {
                 log!("{serial}: {e}");
             }
             drop(reg);
+            hub.answered(serial, id, result.clone()).await;
             match (&result, &outcome) {
                 (Some(r), _) => log!(
                     "{serial}: command {id}: {} {}",
@@ -748,6 +772,11 @@ async fn control_request(req: Request, hub: &Hub) -> Answer {
         },
         Request::Adopt { serial } => answer(hub.adopt(&serial).await),
         Request::Forget { serial } => answer(hub.forget(&serial).await),
+        Request::Powercycle { serial, ports } => match hub.powercycle(&serial, ports).await {
+            Ok(s) if s.error == 0 => Answer::ok(format!("{serial}: {}", s.text)),
+            Ok(s) => Answer::error(format!("{serial} refused: {}", s.text)),
+            Err(e) => Answer::error(e.to_string()),
+        },
     }
 }
 

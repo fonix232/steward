@@ -68,13 +68,13 @@ fn radios_are_set_on_the_devices_own_sections() {
     assert_eq!(values(find(&plan, "radio1").unwrap())["htmode"], "HE80");
     // Every radio option it sets is listed, for the agent to record what it replaces.
     assert!(
-        plan.radio_options
-            .contains(&("radio0".into(), "txpower".into()))
+        plan.device_options
+            .contains(&("wireless".into(), "radio0".into(), "txpower".into()))
     );
     assert!(
-        plan.radio_options
+        plan.device_options
             .iter()
-            .all(|(s, _)| s == "radio0" || s == "radio1")
+            .all(|(c, s, _)| c == "wireless" && (s == "radio0" || s == "radio1"))
     );
 }
 

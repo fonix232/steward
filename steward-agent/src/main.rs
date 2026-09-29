@@ -25,6 +25,7 @@
 mod apply;
 mod clients;
 mod device;
+mod poe;
 mod state;
 
 use futures_util::{SinkExt, StreamExt};
@@ -463,6 +464,11 @@ async fn handle(
                 status: configure(params, ctx).await,
             }
         }
+        command::POWERCYCLE => proto::CommandResult {
+            serial: serial.into(),
+            uuid: None,
+            status: powercycle(params).await,
+        },
         _ => proto::CommandResult {
             serial: serial.into(),
             uuid: None,
@@ -507,6 +513,61 @@ where
             Ok(staged) => return staged,
             Err(e) => return Err(e.to_string()),
         }
+    }
+}
+
+/// `powercycle`: checked now and answered at once; each port is cycled in the background.
+async fn powercycle(params: serde_json::Value) -> proto::CommandStatus {
+    let status = |error, text: String| proto::CommandStatus {
+        error,
+        text,
+        when: None,
+        rejected: vec![],
+    };
+    let req: proto::Powercycle = match serde_json::from_value(params) {
+        Ok(r) => r,
+        Err(e) => return status(2, format!("unreadable request: {e}")),
+    };
+    let cycles = match tokio::task::spawn_blocking(poe::current).await {
+        Ok((p, running, ports)) => poe::plan(&req, p.as_ref(), running, &ports),
+        Err(e) => Err(e.to_string()),
+    };
+    let cycles = match cycles {
+        Ok(c) => c,
+        Err(e) => {
+            log!("power cycle refused: {e}");
+            return status(2, e);
+        }
+    };
+    let names = cycles
+        .iter()
+        .map(|c| format!("{} for {} ms", c.port, c.off.as_millis()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    log!("power cycling {names}");
+    for c in cycles {
+        tokio::spawn(async move {
+            let port = c.port.clone();
+            match tokio::task::spawn_blocking(move || poe::power(&port, false)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return log!("{e}"),
+                Err(e) => return log!("{e}"),
+            }
+            sleep(c.off).await;
+            let port = c.port.clone();
+            match tokio::task::spawn_blocking(move || poe::power(&port, true)).await {
+                Ok(Ok(())) => log!("{}: power back on", c.port),
+                Ok(Err(e)) => log!("{e}"),
+                Err(e) => log!("{e}"),
+            }
+        });
+    }
+    proto::CommandStatus {
+        when: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs()),
+        ..status(0, format!("cycling {names}"))
     }
 }
 
