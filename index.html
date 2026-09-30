@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Steward package feed</title>
+<style>
+	:root { --bg: #fff; --fg: #1d1d1f; --muted: #5f6368; --code: #f3f4f6; --link: #0b62c4; }
+	@media (prefers-color-scheme: dark) {
+		:root { --bg: #16181c; --fg: #e8eaed; --muted: #9aa0a6; --code: #23262c; --link: #8ab4f8; }
+	}
+	body { background: var(--bg); color: var(--fg); font: 16px/1.55 system-ui, sans-serif;
+		max-width: 46rem; margin: 2rem auto; padding: 0 16px; }
+	h1 { font-size: 1.6rem; margin-bottom: .2rem; }
+	p.sub { color: var(--muted); margin-top: 0; }
+	pre { background: var(--code); padding: .8rem 1rem; border-radius: 6px; overflow-x: auto; }
+	code { font: .9rem ui-monospace, monospace; }
+	a { color: var(--link); }
+</style>
+</head>
+<body>
+<h1>Steward package feed</h1>
+<p class="sub">A UniFi-style network controller for OpenWrt &mdash;
+<a href="https://github.com/fonix232/steward">github.com/fonix232/steward</a></p>
+
+<h2>Install (OpenWrt 25.12 and later)</h2>
+<p>On the device that hosts the controller (usually the router):</p>
+<pre><code>wget -O /etc/apk/keys/steward.pem https://fonix232.github.io/steward/steward.pem
+apk add -X https://fonix232.github.io/steward/apk/$(cat /etc/apk/arch)/packages.adb steward</code></pre>
+
+<p>On every other device (access points, switches), install <code>steward-agent</code> instead of
+<code>steward</code>. The agent adds this feed to the device, so later versions arrive with
+<code>apk upgrade</code>.</p>
+</body>
+</html>
